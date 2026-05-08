@@ -89,8 +89,6 @@ async function getReferralSummary(userId) {
       `SELECT
          COALESCE(SUM(amount), 0) AS total_commission_earned,
          COALESCE(SUM(CASE WHEN type = 'deposit'   THEN amount ELSE 0 END), 0) AS deposit_commission,
-         COALESCE(SUM(CASE WHEN type = 'mining'    THEN amount ELSE 0 END), 0) AS mining_commission,
-         COALESCE(SUM(CASE WHEN type = 'arbitrage' THEN amount ELSE 0 END), 0) AS arbitrage_commission
        FROM meta_ct_referral_history
        WHERE user_id = ?`,
       [userId],
