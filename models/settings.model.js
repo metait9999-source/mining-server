@@ -7,14 +7,13 @@ class Settings {
   }
 
   static async updateSettings(settingsData) {
-    const [result] = await db.query(
-      `
-      INSERT INTO settings SET id = 1, ?
-      ON DUPLICATE KEY UPDATE ?
-    `,
-      [settingsData, settingsData],
-    );
-    return result.affectedRows;
+    const fields = Object.keys(settingsData)
+      .map((key) => `${key} = ?`)
+      .join(", ");
+
+    const values = Object.values(settingsData);
+
+    await db.query(`UPDATE settings SET ${fields} WHERE id = 1`, values);
   }
 }
 
