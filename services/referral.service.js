@@ -22,10 +22,10 @@ async function creditReferralCommission({ triggerUserId, coinId, baseAmount }) {
     }
 
     const [[triggerUser]] = await db.query(
-      `SELECT u.id, u.referral_uuid, ref.id AS referrer_id
-       FROM meta_ct_user u
-       LEFT JOIN meta_ct_user ref ON ref.uuid = u.referral_uuid
-       WHERE u.id = ?`,
+      `SELECT u.id, u.referred_by, ref.id AS referrer_id
+   FROM meta_ct_user u
+   LEFT JOIN meta_ct_user ref ON ref.referral_uuid = u.referred_by
+   WHERE u.id = ?`,
       [triggerUserId],
     );
 
