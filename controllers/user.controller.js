@@ -1,13 +1,3 @@
-/**
- * user.controller.js  (FULL FILE — replaces your existing one)
- *
- * Changes from original:
- *  - signUpUser now calls assignCryptoWallets(newUserId) after user creation
- *  - createUserByWallet now calls assignCryptoWallets(newUserId) after user creation
- *  - New endpoint: getDepositAddresses — returns user's chain addresses
- *  - Everything else is unchanged
- */
-
 const bcrypt = require("bcrypt");
 const User = require("../models/user.model");
 const { assignCryptoWallets } = require("../services/userWallets");
@@ -68,12 +58,9 @@ exports.loginUser = async (req, res) => {
   }
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// UPDATED: now assigns crypto wallets after creation
-// ─────────────────────────────────────────────────────────────────────────────
 exports.signUpUser = async (req, res) => {
   try {
-    const { email, mobile, password, ...rest } = req.body;
+    const { email, mobile, password, referral_code, ...rest } = req.body;
 
     const existingUser = await User.getByEmailOrMobile(email || mobile);
     if (existingUser) {
@@ -82,7 +69,17 @@ exports.signUpUser = async (req, res) => {
         .json({ error: "User already exists with this email or mobile" });
     }
 
-    // Generate unique 6-digit UUID
+    let referred_by = null;
+    if (referral_code) {
+      const [[referrer]] = await db.query(
+        "SELECT id, referral_uuid FROM meta_ct_user WHERE referral_uuid = ?",
+        [referral_code.trim().toUpperCase()],
+      );
+      if (referrer) {
+        referred_by = referral_code.trim().toUpperCase();
+      }
+    }
+
     let uuid;
     let isUnique = false;
     while (!isUnique) {
@@ -91,7 +88,6 @@ exports.signUpUser = async (req, res) => {
       if (!userWithUuid) isUnique = true;
     }
 
-    // Generate unique referral UUID
     let referral_uuid;
     let isReferralUnique = false;
     while (!isReferralUnique) {
@@ -108,6 +104,8 @@ exports.signUpUser = async (req, res) => {
     const newUserId = await User.create({
       uuid,
       referral_uuid,
+      referred_by,
+      is_referral: referred_by ? 1 : 0,
       email,
       mobile,
       password: hashedPassword,
@@ -115,18 +113,19 @@ exports.signUpUser = async (req, res) => {
     });
 
     const wallets = await assignCryptoWallets(newUserId);
-    console.log(wallets);
+
     res.status(201).json({
       id: newUserId,
       ...req.body,
       uuid,
       referral_uuid,
+      referred_by,
       password: undefined,
       deposit_addresses: {
         TRX: wallets.wallet_trx,
-        USDT_TRC20: wallets.wallet_trx, // same address
+        USDT_TRC20: wallets.wallet_trx,
         ETH: wallets.wallet_eth,
-        USDT_ERC20: wallets.wallet_eth, // same address
+        USDT_ERC20: wallets.wallet_eth,
         BTC: wallets.wallet_btc,
       },
     });
@@ -135,9 +134,6 @@ exports.signUpUser = async (req, res) => {
   }
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// UPDATED: also assigns crypto wallets for wallet-based signups
-// ─────────────────────────────────────────────────────────────────────────────
 exports.createUserByWallet = async (req, res) => {
   try {
     const { user_wallet, ...rest } = req.body;
