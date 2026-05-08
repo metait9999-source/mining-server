@@ -8,9 +8,7 @@ const userRoutes = require("./routes/user.routes");
 const depositRoutes = require("./routes/deposit.routes");
 const withdrawRoutes = require("./routes/withdraw.routes");
 const userBalanceMetaRoutes = require("./routes/userBalanceMeta.routes");
-const tradeOrderRoutes = require("./routes/tradeOrder.routes");
 const referralRoutes = require("./routes/referralHistory.routes");
-const marketRoutes = require("./routes/marketData.routes");
 const walletRoutes = require("./routes/wallet.routes");
 const timerProfitRoutes = require("./routes/timerProfit.routes");
 const settingsRoutes = require("./routes/settings.routes");
@@ -20,8 +18,9 @@ const conversationRoutes = require("./routes/conversation.routes");
 const permissionsRoutes = require("./routes/permissions.routes");
 const arbitrageRoutes = require("./routes/arbitrage.routes");
 const miningRoutes = require("./routes/mining.routes");
-const loanRoutes = require("./routes/loan.routes");
+const visitorRoutes = require("./routes/visitor.routes");
 const { app, server } = require("./socket/socket");
+const { retryPendingDeposits } = require("./models/depositRequest.model");
 require("./cron/arbitragePayout.cron");
 require("./cron/miningPayout.cron");
 
@@ -38,9 +37,7 @@ app.use("/api/v1/users", userRoutes);
 app.use("/api/v1/deposits", depositRoutes);
 app.use("/api/v1/withdraws", withdrawRoutes);
 app.use("/api/v1/userbalance", userBalanceMetaRoutes);
-app.use("/api/v1/tradeorder", tradeOrderRoutes);
 app.use("/api/v1/referral", referralRoutes);
-app.use("/api/v1/market", marketRoutes);
 app.use("/api/v1/wallets", walletRoutes);
 app.use("/api/v1/timerprofits", timerProfitRoutes);
 app.use("/api/v1/settings", settingsRoutes);
@@ -51,9 +48,9 @@ app.use("/api/v1/messages", messageRoutes);
 app.use("/api/v1/conversation", conversationRoutes);
 app.use("/api/v1/arbitrage", arbitrageRoutes);
 app.use("/api/v1/mining", miningRoutes);
-app.use("/api/v1/loans", loanRoutes);
 app.use("/api/v1/2fa", require("./routes/twofa.routes"));
 app.use("/api/v1/chat-faqs", require("./routes/chatFaq.routes"));
+app.use("/api/v1/visitors", visitorRoutes);
 
 // Error handling middleware
 app.use((err, req, res, next) => {
@@ -65,9 +62,15 @@ app.get("/", (req, res) => {
   res.send("Hi, Welcome to crypto trade api");
 });
 
-// Start the server
 server.listen(PORT, () => {
   console.log(`Server is running on ${PORT}`);
+  setInterval(async () => {
+    try {
+      await retryPendingDeposits();
+    } catch (err) {
+      console.error("[retryPending] Error:", err.message);
+    }
+  }, 50000);
 });
 
 (async () => {

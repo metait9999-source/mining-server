@@ -18,6 +18,7 @@ router.post(
   uploadMiddleware,
   userController.uploadProfileImage,
 );
+router.get("/:userId/deposit-addresses", userController.getDepositAddresses);
 // router.post('/', userController.createUser);
 router.put("/:id", userController.updateUser);
 router.delete("/:id", userController.deleteUser);
