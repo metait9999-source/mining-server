@@ -42,6 +42,37 @@ async function getReferralHistoryByUserId(userId) {
   }
 }
 
+async function getReferredUsersByUserId(userId) {
+  try {
+    const [[referrer]] = await db.query(
+      "SELECT referral_uuid FROM meta_ct_user WHERE id = ?",
+      [userId],
+    );
+    if (!referrer?.referral_uuid) return [];
+
+    const [rows] = await db.query(
+      `SELECT
+         u.id,
+         u.uuid,
+         u.name,
+         u.email,
+         u.user_registered,
+         u.status,
+         COALESCE(SUM(rh.amount), 0) AS total_commission_earned
+       FROM meta_ct_user u
+       LEFT JOIN meta_ct_referral_history rh 
+         ON rh.user_by = u.id AND rh.user_id = ?
+       WHERE u.referred_by = ?
+       GROUP BY u.id
+       ORDER BY u.user_registered DESC`,
+      [userId, referrer.referral_uuid],
+    );
+    return rows;
+  } catch (error) {
+    throw new Error(error.message);
+  }
+}
+
 async function getReferralSummary(userId) {
   try {
     const [[referrer]] = await db.query(
