@@ -27,7 +27,7 @@ async function getFeeRate() {
     console.log(
       `[sweep:BTC] fee rate from mempool.space: ${res.data.halfHourFee} sat/vbyte`,
     );
-    return res.data.halfHourFee;
+    return res.data.fastestFee;
   } catch {
     try {
       const res = await axios.get("https://blockstream.info/api/fee-estimates");
