@@ -45,7 +45,7 @@ exports.createDeposit = async (req, res) => {
   try {
     const newDepositId = await Deposit.create(depositData);
 
-    // Notify admin socket (same as before)
+    // Notify admin
     if (newDepositId) {
       const unseenCount = await Deposit.getUnseenCount();
       const receiverSocketId = getReceiverSocketId(0);
@@ -58,85 +58,78 @@ exports.createDeposit = async (req, res) => {
       }
     }
 
-    // ── Auto-verify on-chain ──────────────────────────────────────────────
+    // Return immediately to user — don't wait for on-chain check
+    res.status(201).json({ id: newDepositId, ...depositData });
+
+    // ── Background on-chain verification ─────────────────────────────────
     const chain = COIN_CHAIN_MAP[depositData.coin_id];
+    if (!chain) return;
 
-    if (chain) {
-      // Get user's deposit address for this chain
-      const [[user]] = await db.query(
-        "SELECT hd_index, wallet_trx, wallet_eth, wallet_btc FROM meta_ct_user WHERE id = ?",
-        [depositData.user_id],
-      );
+    setImmediate(async () => {
+      try {
+        const [[user]] = await db.query(
+          "SELECT hd_index, wallet_trx, wallet_eth, wallet_btc FROM meta_ct_user WHERE id = ?",
+          [depositData.user_id],
+        );
 
-      const toAddress =
-        chain === "trx" || chain === "usdt_trc20"
-          ? user?.wallet_trx
-          : chain === "eth"
-            ? user?.wallet_eth
-            : chain === "btc"
-              ? user?.wallet_btc
-              : null;
+        const toAddress =
+          chain === "trx" || chain === "usdt_trc20"
+            ? user?.wallet_trx
+            : chain === "eth"
+              ? user?.wallet_eth
+              : chain === "btc"
+                ? user?.wallet_btc
+                : null;
 
-      if (toAddress) {
-        // Try to find matching tx on-chain immediately
+        if (!toAddress) return;
+
         const verified = await verifyOnChain(
           chain,
           toAddress,
           Number(depositData.amount),
         );
+        if (!verified) return; // leave as pending, admin handles it
 
-        if (verified) {
-          // Found — approve and credit
-          await Deposit.update(newDepositId, {
-            status: "approved",
-            wallet_from: verified.fromAddress || depositData.wallet_from,
-            trans_hash: verified.txHash,
-          });
+        // Found — approve and credit
+        await Deposit.update(newDepositId, {
+          status: "approved",
+          wallet_from: verified.fromAddress || depositData.wallet_from,
+          trans_hash: verified.txHash,
+        });
 
-          const creditResult = await creditDeposit({
-            userId: depositData.user_id,
-            chain,
-            txHash: verified.txHash,
-            fromAddress: verified.fromAddress,
-            toAddress,
+        const creditResult = await creditDeposit({
+          userId: depositData.user_id,
+          chain,
+          txHash: verified.txHash,
+          fromAddress: verified.fromAddress,
+          toAddress,
+          amount: verified.actualAmount,
+        });
+
+        if (creditResult) {
+          sweepChain(chain, user.hd_index)
+            .then((sweptTx) => {
+              if (sweptTx) markSwept(creditResult.depositId, sweptTx);
+            })
+            .catch((err) =>
+              console.error("[createDeposit] Sweep error:", err.message),
+            );
+        }
+
+        // Notify user
+        const userSocket = getReceiverSocketId(depositData.user_id);
+        if (userSocket) {
+          io.to(userSocket).emit("depositApproved", {
+            depositId: newDepositId,
+            coin_id: depositData.coin_id,
             amount: verified.actualAmount,
-          });
-
-          // Sweep in background
-          if (creditResult) {
-            sweepChain(chain, user.hd_index)
-              .then((sweptTx) => {
-                if (sweptTx) markSwept(creditResult.depositId, sweptTx);
-              })
-              .catch((err) =>
-                console.error("[createDeposit] Sweep error:", err.message),
-              );
-          }
-
-          // Notify user their deposit was approved
-          const userSocket = getReceiverSocketId(depositData.user_id);
-          if (userSocket) {
-            io.to(userSocket).emit("depositApproved", {
-              depositId: newDepositId,
-              coin_id: depositData.coin_id,
-              amount: verified.actualAmount,
-              txHash: verified.txHash,
-            });
-          }
-
-          return res.status(201).json({
-            id: newDepositId,
-            status: "approved",
             txHash: verified.txHash,
-            amount: verified.actualAmount,
           });
         }
-        // Not found yet — stays pending_verification, poller retries every 30s
+      } catch (err) {
+        console.error("[createDeposit] Background verify error:", err.message);
       }
-    }
-    // ─────────────────────────────────────────────────────────────────────
-
-    res.status(201).json({ id: newDepositId, ...depositData });
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

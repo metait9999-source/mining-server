@@ -182,11 +182,6 @@ async function activateAllAddresses({ wallet_trx, wallet_eth, wallet_btc }) {
   // console.log(
   //   `[activation] Done. TRX: ${trxTx.value || "failed"} | ETH: ${ethTx.value || "failed"} | BTC: ${btcTx.value || "failed"}`,
   // );
-
-  const trxResult =
-    results[0]?.status === "fulfilled" ? results[0]?.value : "failed";
-
-  console.log(`[activation] Done. TRX: ${trxResult || "failed"}`);
 }
 
 module.exports = {
