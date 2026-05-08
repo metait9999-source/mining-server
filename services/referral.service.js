@@ -23,9 +23,9 @@ async function creditReferralCommission({ triggerUserId, coinId, baseAmount }) {
 
     const [[triggerUser]] = await db.query(
       `SELECT u.id, u.referred_by, ref.id AS referrer_id
-   FROM meta_ct_user u
-   LEFT JOIN meta_ct_user ref ON ref.referral_uuid = u.referred_by
-   WHERE u.id = ?`,
+       FROM meta_ct_user u
+       LEFT JOIN meta_ct_user ref ON ref.referral_uuid = u.referred_by
+       WHERE u.id = ?`,
       [triggerUserId],
     );
 
@@ -34,6 +34,22 @@ async function creditReferralCommission({ triggerUserId, coinId, baseAmount }) {
     }
 
     const referrerId = triggerUser.referrer_id;
+
+    const [[recentCredit]] = await db.query(
+      `SELECT id FROM meta_ct_referral_history
+        WHERE user_by = ?
+          AND coin_id = ?
+          AND type = 'deposit'
+          AND created_at > NOW() - INTERVAL 5 MINUTE`,
+      [triggerUserId, coinId],
+    );
+
+    if (recentCredit) {
+      console.log(
+        `[Referral] Already credited for user=${triggerUserId}, skipping.`,
+      );
+      return { credited: false, reason: "already credited recently" };
+    }
 
     const commissionAmount = parseFloat(((baseAmount * pct) / 100).toFixed(7));
     if (commissionAmount <= 0) {
@@ -51,14 +67,14 @@ async function creditReferralCommission({ triggerUserId, coinId, baseAmount }) {
 
     await db.query(
       `UPDATE meta_ct_user_balance_meta
-       SET coin_amount = coin_amount + ?
+         SET coin_amount = coin_amount + ?
        WHERE user_id = ? AND coin_id = ?`,
       [commissionAmount, referrerId, coinId],
     );
 
     await db.query(
       `UPDATE meta_ct_user
-       SET referral_bonus = referral_bonus + ?
+         SET referral_bonus = referral_bonus + ?
        WHERE id = ?`,
       [commissionAmount, referrerId],
     );

@@ -72,13 +72,14 @@ exports.createDeposit = async (req, res) => {
           [depositData.user_id],
         );
 
+        // ✅ Fix — add the btc branch
         const toAddress =
           chain === "trx" || chain === "usdt_trc20"
             ? user?.wallet_trx
             : chain === "eth"
               ? user?.wallet_eth
               : chain === "btc"
-                ? user?.wallet_btc
+                ? user?.wallet_btc // ← add this
                 : null;
 
         if (!toAddress) return;

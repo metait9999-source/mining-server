@@ -12,9 +12,8 @@ const tronWeb = new TronWeb({
 const USDT_TRC20_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t";
 const USDT_ERC20_CONTRACT = "0xdAC17F958D2ee523a2206206994597C13D831ec7";
 
-// How far back to scan (in seconds / blocks) for matching tx
-const SCAN_WINDOW_TRON_SEC = 30 * 60; // 30 minutes
-const SCAN_WINDOW_ETH_BLOCKS = 150; // ~30 min at 12s/block
+const SCAN_WINDOW_TRON_SEC = 30 * 60;
+const SCAN_WINDOW_ETH_BLOCKS = 150;
 const SCAN_WINDOW_BTC_CONFIRMATIONS = 3;
 
 /**
@@ -23,9 +22,9 @@ const SCAN_WINDOW_BTC_CONFIRMATIONS = 3;
 const COIN_CHAIN_MAP = {
   TRX: "trx",
   "USDT-TRC20": "usdt_trc20",
-  // ETH: "eth",
-  // "USDT-ERC20": "usdt_erc20",
-  // BTC: "btc",
+  ETH: "eth",
+  "USDT-ERC20": "usdt_erc20",
+  BTC: "btc",
 };
 
 async function verifyTRC20Deposit(toAddress, expectedAmount) {
@@ -116,99 +115,147 @@ async function verifyTRXDeposit(toAddress, expectedAmount) {
 
 async function verifyERC20Deposit(toAddress, expectedAmount) {
   const KEY = process.env.ETHERSCAN_API_KEY;
+  const BASE = "https://api.etherscan.io/v2/api";
+  const CHAIN_ID = 1;
 
-  // Get current block
-  const blockRes = await axios.get("https://api.etherscan.io/api", {
-    params: { module: "proxy", action: "eth_blockNumber", apikey: KEY },
-  });
-  const currentBlock = parseInt(blockRes.data.result, 16);
-  const startBlock = currentBlock - SCAN_WINDOW_ETH_BLOCKS;
+  try {
+    const blockRes = await axios.get(BASE, {
+      params: {
+        chainid: CHAIN_ID,
+        module: "proxy",
+        action: "eth_blockNumber",
+        apikey: KEY,
+      },
+    });
+    const currentBlock = parseInt(blockRes.data.result, 16);
+    const startBlock = isNaN(currentBlock)
+      ? 0
+      : currentBlock - SCAN_WINDOW_ETH_BLOCKS;
 
-  const res = await axios.get("https://api.etherscan.io/api", {
-    params: {
-      module: "account",
-      action: "tokentx",
-      contractaddress: USDT_ERC20_CONTRACT,
-      address: toAddress,
-      startblock: startBlock,
-      endblock: 99999999,
-      sort: "desc",
-      apikey: KEY,
-    },
-  });
+    const res = await axios.get(BASE, {
+      params: {
+        chainid: CHAIN_ID,
+        module: "account",
+        action: "tokentx",
+        contractaddress: USDT_ERC20_CONTRACT,
+        address: toAddress,
+        startblock: startBlock,
+        endblock: 99999999,
+        sort: "desc",
+        apikey: KEY,
+      },
+    });
 
-  for (const tx of res.data?.result || []) {
-    if (tx.to.toLowerCase() !== toAddress.toLowerCase()) continue;
-    const amount = Number(tx.value) / 1_000_000;
-    if (amount >= expectedAmount * 0.99) {
-      return { txHash: tx.hash, fromAddress: tx.from, actualAmount: amount };
+    for (const tx of res.data?.result || []) {
+      if (!tx.to) continue;
+      if (tx.to.toLowerCase() !== toAddress.toLowerCase()) continue;
+      const amount = Number(tx.value) / 1_000_000;
+      if (amount >= expectedAmount * 0.99) {
+        return { txHash: tx.hash, fromAddress: tx.from, actualAmount: amount };
+      }
     }
+    return null;
+  } catch (err) {
+    console.error("[verifyERC20Deposit] Error:", err.message);
+    return null;
   }
-  return null;
 }
 
 async function verifyETHDeposit(toAddress, expectedAmount) {
   const KEY = process.env.ETHERSCAN_API_KEY;
-  const blockRes = await axios.get("https://api.etherscan.io/api", {
-    params: { module: "proxy", action: "eth_blockNumber", apikey: KEY },
-  });
-  const currentBlock = parseInt(blockRes.data.result, 16);
-  const startBlock = currentBlock - SCAN_WINDOW_ETH_BLOCKS;
 
-  const res = await axios.get("https://api.etherscan.io/api", {
-    params: {
-      module: "account",
-      action: "txlist",
-      address: toAddress,
-      startblock: startBlock,
-      endblock: 99999999,
-      sort: "desc",
-      apikey: KEY,
-    },
-  });
+  try {
+    // ← V2 URL use করো
+    const BASE = "https://api.etherscan.io/v2/api";
+    const CHAIN_ID = 1; // Ethereum mainnet
 
-  for (const tx of res.data?.result || []) {
-    if (tx.to.toLowerCase() !== toAddress.toLowerCase()) continue;
-    if (tx.isError !== "0") continue;
-    const amount = Number(BigInt(tx.value)) / 1e18;
-    if (amount >= expectedAmount * 0.99) {
-      return { txHash: tx.hash, fromAddress: tx.from, actualAmount: amount };
+    const blockRes = await axios.get(BASE, {
+      params: {
+        chainid: CHAIN_ID,
+        module: "proxy",
+        action: "eth_blockNumber",
+        apikey: KEY,
+      },
+    });
+    const currentBlock = parseInt(blockRes.data.result, 16);
+    const startBlock = isNaN(currentBlock)
+      ? 0
+      : currentBlock - SCAN_WINDOW_ETH_BLOCKS;
+
+    const res = await axios.get(BASE, {
+      params: {
+        chainid: CHAIN_ID,
+        module: "account",
+        action: "txlist",
+        address: toAddress,
+        startblock: startBlock,
+        endblock: 99999999,
+        sort: "desc",
+        apikey: KEY,
+      },
+    });
+
+    for (const tx of res.data?.result || []) {
+      if (!tx.to) continue;
+      if (tx.to.toLowerCase() !== toAddress.toLowerCase()) continue;
+      if (tx.isError !== "0") continue;
+      const amount = Number(BigInt(tx.value)) / 1e18;
+      if (amount >= expectedAmount * 0.99) {
+        return { txHash: tx.hash, fromAddress: tx.from, actualAmount: amount };
+      }
     }
+    return null;
+  } catch (err) {
+    console.error("[verifyETHDeposit] Error:", err.message);
+    return null;
   }
-  return null;
 }
 
 async function verifyBTCDeposit(toAddress, expectedAmount) {
-  const res = await axios.get(
-    `https://api.blockcypher.com/v1/btc/main/addrs/${toAddress}/full`,
-    {
-      params: {
-        token: process.env.BLOCKCYPHER_TOKEN,
-        limit: 10,
-        confirmations: 1,
-      },
-    },
-  );
+  try {
+    const res = await axios.get(
+      `https://blockstream.info/api/address/${toAddress}/txs`,
+    );
 
-  for (const tx of res.data?.txs || []) {
-    if ((tx.confirmations || 0) < 1) continue;
-    for (const out of tx.outputs || []) {
-      if (!out.addresses?.includes(toAddress)) continue;
-      const amount = out.value / 1e8;
+    console.log(
+      `[verifyBTCDeposit] address=${toAddress} tx count=${res.data?.length}`,
+    );
+
+    for (const tx of res.data || []) {
+      const confirmed = tx.status?.confirmed;
+      const MIN_CONFIRMATIONS = process.env.NODE_ENV === "production" ? 1 : 0;
+
+      if (MIN_CONFIRMATIONS > 0 && !confirmed) continue;
+
+      // Find the output that pays toAddress
+      const output = tx.vout?.find((v) => v.scriptpubkey_address === toAddress);
+      if (!output) continue;
+
+      const amount = output.value / 1e8;
+      console.log(
+        `[verifyBTCDeposit] tx=${tx.txid} confirmed=${confirmed} amount=${amount} BTC`,
+      );
+
       if (amount >= expectedAmount * 0.99) {
         return {
-          txHash: tx.hash,
-          fromAddress: tx.inputs?.[0]?.addresses?.[0] || null,
+          txHash: tx.txid,
+          fromAddress: null,
           actualAmount: amount,
         };
       }
     }
+    return null;
+  } catch (err) {
+    if (err.response?.status === 404) return null;
+    console.error(
+      "[verifyBTCDeposit] Error:",
+      err.response?.data || err.message,
+    );
+    return null;
   }
-  return null;
 }
 
 async function createDepositRequest({ userId, coinId, amount }) {
-  // 1. Get user's chain address
   const [[user]] = await db.query(
     "SELECT id, hd_index, wallet_trx, wallet_eth, wallet_btc FROM meta_ct_user WHERE id = ?",
     [userId],

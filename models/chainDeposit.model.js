@@ -1,17 +1,7 @@
-/**
- * chainDeposit.model.js
- *
- * Handles recording on-chain deposits, crediting user balances,
- * and tracking sweep status — all in one atomic transaction.
- */
-
 const db = require("../config/db.config");
+const axios = require("axios");
 const { creditReferralCommission } = require("../services/referral.service");
 
-/**
- * Chain → coin_id mapping.
- * Adjust these to match your meta_ct_wallets.coin_id values exactly.
- */
 const CHAIN_COIN_MAP = {
   trx: "TRX",
   usdt_trc20: "USDT-TRC20",
@@ -20,10 +10,27 @@ const CHAIN_COIN_MAP = {
   btc: "BTC",
 };
 
-/**
- * Check whether a tx_hash + chain combo has already been processed.
- * Prevents double-crediting on re-polls.
- */
+const COINLORE_IDS = {
+  trx: 87,
+  eth: 80,
+  btc: 90,
+  usdt_trc20: null,
+  usdt_erc20: null,
+};
+
+async function getCoinPriceUSD(chain) {
+  const id = COINLORE_IDS[chain];
+  if (!id) return 1;
+  try {
+    const res = await axios.get(
+      `https://api.coinlore.net/api/ticker/?id=${id}`,
+    );
+    return parseFloat(res.data?.[0]?.price_usd || 1);
+  } catch {
+    return 1;
+  }
+}
+
 async function isAlreadyProcessed(txHash, chain) {
   const [[row]] = await db.query(
     "SELECT id FROM meta_ct_chain_deposits WHERE tx_hash = ? AND chain = ?",
@@ -40,7 +47,6 @@ async function creditDeposit({
   toAddress,
   amount,
 }) {
-  // Idempotency guard — if already recorded, skip
   if (await isAlreadyProcessed(txHash, chain)) {
     console.log(
       `[chainDeposit] Already processed tx ${txHash} on ${chain}, skipping.`,
@@ -51,11 +57,17 @@ async function creditDeposit({
   const coinId = CHAIN_COIN_MAP[chain];
   if (!coinId) throw new Error(`Unknown chain: ${chain}`);
 
+  const priceUSD = await getCoinPriceUSD(chain);
+  const usdAmount = parseFloat((amount * priceUSD).toFixed(7));
+  console.log(
+    `[chainDeposit] ${amount} ${chain} × $${priceUSD} = $${usdAmount} USD`,
+  );
+
   const connection = await db.getConnection();
   try {
     await connection.beginTransaction();
 
-    // 1. Insert deposit record
+    // 1. Insert chain deposit record
     const [insertResult] = await connection.query(
       `INSERT INTO meta_ct_chain_deposits
          (user_id, chain, coin_id, tx_hash, from_address, to_address, amount, status)
@@ -64,23 +76,17 @@ async function creditDeposit({
     );
     const depositId = insertResult.insertId;
 
-    // 2. Ensure a balance row exists (upsert)
+    // 2. Insert balance row if not exists, otherwise ADD to existing balance
     await connection.query(
       `INSERT INTO meta_ct_user_balance_meta (user_id, coin_id, coin_amount, usd_amount)
-       VALUES (?, ?, 0, 0)
-       ON DUPLICATE KEY UPDATE updated_at = updated_at`,
-      [userId, coinId],
+       VALUES (?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         coin_amount = coin_amount + VALUES(coin_amount),
+         usd_amount  = usd_amount  + VALUES(usd_amount)`,
+      [userId, coinId, usdAmount, usdAmount],
     );
 
-    // 3. Credit the balance
-    await connection.query(
-      `UPDATE meta_ct_user_balance_meta
-          SET coin_amount = coin_amount + ?
-        WHERE user_id = ? AND coin_id = ?`,
-      [amount, userId, coinId],
-    );
-
-    // 4. Set trade limit (mirrors existing deposit approval logic)
+    // 3. Set trade limit
     await connection.query(
       "UPDATE meta_ct_user SET trade_limit = 50 WHERE id = ?",
       [userId],
@@ -88,13 +94,13 @@ async function creditDeposit({
 
     await connection.commit();
 
-    // 5. Referral commission (outside transaction — non-fatal if it fails)
+    // 4. Referral commission — outside transaction, non-fatal
     try {
       await creditReferralCommission({
         triggerUserId: userId,
         type: "deposit",
         coinId,
-        baseAmount: amount,
+        baseAmount: usdAmount,
       });
     } catch (refErr) {
       console.error(
@@ -103,7 +109,7 @@ async function creditDeposit({
       );
     }
 
-    return { depositId, coinId, amount };
+    return { depositId, coinId, amount, usdAmount };
   } catch (err) {
     await connection.rollback();
     throw err;
@@ -112,9 +118,6 @@ async function creditDeposit({
   }
 }
 
-/**
- * Mark a deposit record as swept (after funds moved to master wallet).
- */
 async function markSwept(depositId, sweptTx) {
   await db.query(
     "UPDATE meta_ct_chain_deposits SET status = 'swept', swept_tx = ? WHERE id = ?",
@@ -122,9 +125,6 @@ async function markSwept(depositId, sweptTx) {
   );
 }
 
-/**
- * Get all unswept confirmed deposits (used by sweep cron if needed).
- */
 async function getUnswept() {
   const [rows] = await db.query(
     "SELECT * FROM meta_ct_chain_deposits WHERE status = 'confirmed'",

@@ -1,10 +1,3 @@
-/**
- * sweep.js  (updated — master addresses from DB, not env)
- *
- * Reads master wallet addresses from meta_ct_wallets via getMasterWallets().
- * Everything else is the same sweep logic as before.
- */
-
 require("dotenv").config();
 const { TronWeb } = require("tronweb");
 const { ethers } = require("ethers");
@@ -26,6 +19,59 @@ const ETH_GAS_RESERVE = "0.005";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ─────────────────────────────────────────────────────────────────────────────
+async function getFeeRate() {
+  try {
+    const res = await axios.get(
+      "https://mempool.space/api/v1/fees/recommended",
+    );
+    console.log(
+      `[sweep:BTC] fee rate from mempool.space: ${res.data.halfHourFee} sat/vbyte`,
+    );
+    return res.data.halfHourFee;
+  } catch {
+    try {
+      const res = await axios.get("https://blockstream.info/api/fee-estimates");
+      const rate = Math.ceil(res.data["3"]);
+      console.log(
+        `[sweep:BTC] fee rate from blockstream fallback: ${rate} sat/vbyte`,
+      );
+      return rate;
+    } catch {
+      console.log("[sweep:BTC] fee rate fallback to hardcoded 20 sat/vbyte");
+      return 20;
+    }
+  }
+}
+
+async function broadcastTx(rawTx) {
+  try {
+    const res = await axios.post("https://mempool.space/api/tx", rawTx, {
+      headers: { "Content-Type": "text/plain" },
+    });
+    console.log("[sweep:BTC] broadcast success via mempool.space");
+    return res.data;
+  } catch (err) {
+    console.error(
+      "[sweep:BTC] mempool.space failed:",
+      err.response?.data || err.message,
+    );
+    try {
+      const res = await axios.post("https://blockstream.info/api/tx", rawTx, {
+        headers: { "Content-Type": "text/plain" },
+      });
+      console.log("[sweep:BTC] broadcast success via blockstream");
+      return res.data;
+    } catch (err2) {
+      console.error(
+        "[sweep:BTC] blockstream failed:",
+        err2.response?.data || err2.message,
+      );
+      throw new Error(`Broadcast failed on all providers: ${err2.message}`);
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 async function sweepTRX(hdIndex) {
   const master = await getMasterWallets();
   const wallets = deriveAllWallets(process.env.WALLET_MNEMONIC, hdIndex);
@@ -38,7 +84,7 @@ async function sweepTRX(hdIndex) {
 
   const balanceSun = await depositTron.trx.getBalance(wallets.trx);
   const balance = balanceSun / 1_000_000;
-  const sweepable = balance - 1; // keep 1 TRX for fees
+  const sweepable = balance - 1;
 
   if (sweepable <= 0) {
     console.log(`[sweep:TRX] Nothing to sweep from ${wallets.trx}`);
@@ -80,7 +126,6 @@ async function sweepUSDT_TRC20(hdIndex) {
     return null;
   }
 
-  // Fund TRX for gas if needed
   const trxSun = await masterTron.trx.getBalance(wallets.trx);
   if (trxSun / 1_000_000 < TRX_GAS_RESERVE) {
     const needed = TRX_GAS_RESERVE - trxSun / 1_000_000;
@@ -158,7 +203,6 @@ async function sweepUSDT_ERC20(hdIndex) {
     return null;
   }
 
-  // Fund ETH for gas if needed
   const ethBalance = await provider.getBalance(signer.address);
   const gasReserve = ethers.parseEther(ETH_GAS_RESERVE);
   if (ethBalance < gasReserve) {
@@ -178,66 +222,147 @@ async function sweepUSDT_ERC20(hdIndex) {
   return tx.hash;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 async function sweepBTC(hdIndex) {
   const master = await getMasterWallets();
   const wallets = deriveAllWallets(process.env.WALLET_MNEMONIC, hdIndex);
-  const TOKEN = process.env.BLOCKCYPHER_TOKEN;
   const address = wallets.btc;
 
-  const utxoRes = await axios.get(
-    `https://api.blockcypher.com/v1/btc/main/addrs/${address}?unspentOnly=true`,
-    { params: { token: TOKEN } },
+  console.log(
+    `[sweep:BTC] starting for address=${address} master=${master.btc}`,
   );
-  const utxos = utxoRes.data.txrefs || [];
+
+  // 1. Fetch UTXOs from Blockstream
+  const utxoRes = await axios.get(
+    `https://blockstream.info/api/address/${address}/utxo`,
+  );
+  const utxos = utxoRes.data || [];
+  console.log(`[sweep:BTC] UTXOs found: ${utxos.length}`);
+
   if (!utxos.length) {
     console.log(`[sweep:BTC] No UTXOs at ${address}`);
     return null;
   }
 
-  const feeRes = await axios.get("https://api.blockcypher.com/v1/btc/main", {
-    params: { token: TOKEN },
-  });
-  const feeRate = feeRes.data.medium_fee_per_kb / 1000;
-  const estSize = utxos.length * 148 + 34 + 10;
+  // 2. Get fee rate with fallback
+  const feeRate = await getFeeRate();
+
+  // 3. Derive key pair
+  const keyPair = ECPair.fromPrivateKey(
+    Buffer.from(wallets.privateKeys.btc, "hex"),
+    { network: bitcoin.networks.bitcoin },
+  );
+
+  // 4. Detect address type and build payment accordingly
+  const isLegacy = address.startsWith("1");
+  const isP2SH = address.startsWith("3");
+  const isSegWit = address.startsWith("bc1");
+
+  console.log(
+    `[sweep:BTC] address type: ${isLegacy ? "legacy P2PKH" : isP2SH ? "P2SH" : "native SegWit"}`,
+  );
+
+  let payment;
+  let inputTemplate;
+  let bytesPerInput;
+
+  if (isLegacy) {
+    // P2PKH legacy
+    payment = bitcoin.payments.p2pkh({
+      pubkey: Buffer.from(keyPair.publicKey),
+      network: bitcoin.networks.bitcoin,
+    });
+    bytesPerInput = 148;
+    // For legacy we need full raw tx hex
+  } else if (isP2SH) {
+    // P2SH-P2WPKH wrapped SegWit
+    payment = bitcoin.payments.p2sh({
+      redeem: bitcoin.payments.p2wpkh({
+        pubkey: Buffer.from(keyPair.publicKey),
+        network: bitcoin.networks.bitcoin,
+      }),
+      network: bitcoin.networks.bitcoin,
+    });
+    bytesPerInput = 91;
+  } else {
+    // Native SegWit P2WPKH
+    payment = bitcoin.payments.p2wpkh({
+      pubkey: Buffer.from(keyPair.publicKey),
+      network: bitcoin.networks.bitcoin,
+    });
+    bytesPerInput = 68;
+  }
+
+  // 5. Estimate fee
+  const estSize = utxos.length * bytesPerInput + 34 + 10;
   const feeSat = Math.ceil(feeRate * estSize);
   const totalSat = utxos.reduce((s, u) => s + u.value, 0);
   const sweepSat = totalSat - feeSat;
+  console.log(
+    `[sweep:BTC] totalSat=${totalSat} feeSat=${feeSat} sweepSat=${sweepSat}`,
+  );
 
   if (sweepSat <= 0) {
     console.log(`[sweep:BTC] Balance too low to cover fees at ${address}`);
     return null;
   }
 
-  const keyPair = ECPair.fromPrivateKey(
-    Buffer.from(wallets.privateKeys.btc, "hex"),
-    { network: bitcoin.networks.bitcoin },
-  );
+  // 6. Build PSBT
   const psbt = new bitcoin.Psbt({ network: bitcoin.networks.bitcoin });
 
   for (const utxo of utxos) {
-    const txRes = await axios.get(
-      `https://api.blockcypher.com/v1/btc/main/txs/${utxo.tx_hash}?includeHex=true`,
-      { params: { token: TOKEN } },
+    if (isLegacy) {
+      // Legacy requires full raw tx hex
+      const txHexRes = await axios.get(
+        `https://blockstream.info/api/tx/${utxo.txid}/hex`,
+      );
+      psbt.addInput({
+        hash: utxo.txid,
+        index: utxo.vout,
+        nonWitnessUtxo: Buffer.from(txHexRes.data, "hex"),
+      });
+    } else if (isP2SH) {
+      psbt.addInput({
+        hash: utxo.txid,
+        index: utxo.vout,
+        witnessUtxo: {
+          script: Buffer.from(payment.output),
+          value: BigInt(utxo.value),
+        },
+        redeemScript: Buffer.from(payment.redeem.output),
+      });
+    } else {
+      psbt.addInput({
+        hash: utxo.txid,
+        index: utxo.vout,
+        witnessUtxo: {
+          script: Buffer.from(payment.output),
+          value: BigInt(utxo.value),
+        },
+      });
+    }
+    console.log(
+      `[sweep:BTC] added input: ${utxo.txid}:${utxo.vout} value=${utxo.value}`,
     );
-    psbt.addInput({
-      hash: utxo.tx_hash,
-      index: utxo.tx_output_n,
-      nonWitnessUtxo: Buffer.from(txRes.data.hex, "hex"),
-    });
   }
 
-  psbt.addOutput({ address: master.btc, value: sweepSat });
+  // 7. Add output
+  const outputScript = bitcoin.address.toOutputScript(
+    master.btc,
+    bitcoin.networks.bitcoin,
+  );
+  psbt.addOutput({
+    script: outputScript,
+    value: BigInt(sweepSat),
+  });
+
+  // 8. Sign and finalize
   psbt.signAllInputs(keyPair);
   psbt.finalizeAllInputs();
   const rawTx = psbt.extractTransaction().toHex();
+  console.log(`[sweep:BTC] raw tx built, broadcasting...`);
 
-  const broadcastRes = await axios.post(
-    "https://api.blockcypher.com/v1/btc/main/txs/push",
-    { tx: rawTx },
-    { params: { token: TOKEN } },
-  );
-  const txHash = broadcastRes.data.tx.hash;
+  // 9. Broadcast with fallback
+  const txHash = await broadcastTx(rawTx);
   console.log(
     `[sweep:BTC] ✅ ${sweepSat / 1e8} BTC → ${master.btc} | tx: ${txHash}`,
   );
