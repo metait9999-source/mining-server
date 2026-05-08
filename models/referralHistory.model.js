@@ -85,16 +85,20 @@ async function getReferralSummary(userId) {
       [referrer?.referral_uuid || ""],
     );
 
-    const [rows] = await db.query(
+    const [[commission]] = await db.query(
       `SELECT
          COALESCE(SUM(amount), 0) AS total_commission_earned,
-         COALESCE(SUM(CASE WHEN type = 'deposit'   THEN amount ELSE 0 END), 0) AS deposit_commission,
+         COALESCE(SUM(CASE WHEN type = 'deposit' THEN amount ELSE 0 END), 0) AS deposit_commission
        FROM meta_ct_referral_history
        WHERE user_id = ?`,
       [userId],
     );
 
-    return { ...rows[0], total_referred_users: userCount.total_referred_users };
+    return {
+      total_referred_users: userCount.total_referred_users,
+      total_commission_earned: commission.total_commission_earned,
+      deposit_commission: commission.deposit_commission,
+    };
   } catch (error) {
     throw new Error(error.message);
   }
