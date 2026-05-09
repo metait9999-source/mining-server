@@ -151,20 +151,17 @@ async function processPayout(subscriptionId) {
 
     const isComplete = new Date() >= new Date(sub.end_date);
 
-    // Daily interest = rent_amount * daily_rate / 100
     const interest = (
       (parseFloat(sub.rent_amount) * parseFloat(sub.daily_rate)) /
       100
     ).toFixed(7);
 
-    // Get USDT coin_id
     const [walletRows] = await conn.query(
       `SELECT coin_id FROM meta_ct_wallets WHERE coin_symbol = 'USDT' LIMIT 1`,
     );
     const usdtCoinId = walletRows[0]?.coin_id;
     if (!usdtCoinId) throw new Error("USDT wallet not configured");
 
-    // Credit daily interest
     await conn.query(
       `UPDATE meta_ct_user_balance_meta
        SET coin_amount = coin_amount + ?, updated_at = NOW()
@@ -172,20 +169,17 @@ async function processPayout(subscriptionId) {
       [interest, sub.user_id, usdtCoinId],
     );
 
-    // Log interest payout
     await conn.query(
       `INSERT INTO mining_payouts (subscription_id, user_id, amount, type)
        VALUES (?, ?, ?, 'interest')`,
       [sub.id, sub.user_id, interest],
     );
 
-    // Update total_earned
     await conn.query(
       `UPDATE mining_subscriptions SET total_earned = total_earned + ? WHERE id = ?`,
       [interest, sub.id],
     );
 
-    // On completion — return principal
     if (isComplete) {
       await conn.query(
         `UPDATE meta_ct_user_balance_meta
@@ -201,7 +195,6 @@ async function processPayout(subscriptionId) {
       );
     }
 
-    // Update status
     await conn.query(
       `UPDATE mining_subscriptions
        SET last_paid_at = NOW(), status = ?, updated_at = NOW()
@@ -235,13 +228,11 @@ async function cancel(subscriptionId, userId) {
     const sub = rows[0];
     if (!sub) throw new Error("Active subscription not found");
 
-    // Get USDT coin_id
     const [walletRows] = await conn.query(
       `SELECT coin_id FROM meta_ct_wallets WHERE coin_symbol = 'USDT' LIMIT 1`,
     );
     const usdtCoinId = walletRows[0]?.coin_id;
 
-    // Return principal
     await conn.query(
       `UPDATE meta_ct_user_balance_meta
        SET coin_amount = coin_amount + ?, updated_at = NOW()
