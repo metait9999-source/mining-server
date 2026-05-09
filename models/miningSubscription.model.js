@@ -5,7 +5,6 @@ async function subscribe(userId, packageId, quantity) {
   try {
     await conn.beginTransaction();
 
-    // 1. Validate package
     const [pkgRows] = await conn.query(
       "SELECT * FROM mining_packages WHERE id = ? AND status = 1",
       [packageId],
@@ -15,37 +14,76 @@ async function subscribe(userId, packageId, quantity) {
 
     const totalCost = parseFloat(pkg.rent_amount) * quantity;
 
-    // 2. Check USDT balance (mining always uses USDT)
-    const [balRows] = await conn.query(
-      `SELECT * FROM meta_ct_user_balance_meta
-       WHERE user_id = ? AND coin_id = (
-         SELECT coin_id FROM meta_ct_wallets WHERE coin_symbol = 'USDT' LIMIT 1
-       )`,
-      [userId],
+    const [usdtWalletRows] = await conn.query(
+      `SELECT coin_id FROM meta_ct_wallets WHERE coin_symbol = 'USDT' LIMIT 1`,
     );
+    const usdtCoinId = usdtWalletRows[0]?.coin_id;
+    if (!usdtCoinId) throw new Error("USDT wallet not configured");
 
-    if (
-      balRows.length === 0 ||
-      parseFloat(balRows[0].coin_amount) < totalCost
-    ) {
-      throw new Error(`Insufficient USDT balance. Required: ${totalCost}`);
+    const [usdtBalRows] = await conn.query(
+      `SELECT * FROM meta_ct_user_balance_meta WHERE user_id = ? AND coin_id = ?`,
+      [userId, usdtCoinId],
+    );
+    const usdtBalance = parseFloat(usdtBalRows[0]?.coin_amount || 0);
+
+    let remainingCost = totalCost;
+
+    if (usdtBalance >= totalCost) {
+      await conn.query(
+        `UPDATE meta_ct_user_balance_meta
+         SET coin_amount = coin_amount - ?, updated_at = NOW()
+         WHERE user_id = ? AND coin_id = ?`,
+        [totalCost, userId, usdtCoinId],
+      );
+      remainingCost = 0;
+    } else if (usdtBalance > 0) {
+      await conn.query(
+        `UPDATE meta_ct_user_balance_meta
+         SET coin_amount = coin_amount - ?, updated_at = NOW()
+         WHERE user_id = ? AND coin_id = ?`,
+        [usdtBalance, userId, usdtCoinId],
+      );
+      remainingCost = parseFloat((totalCost - usdtBalance).toFixed(8));
     }
 
-    const usdtCoinId = balRows[0].coin_id;
+    if (remainingCost > 0) {
+      const [otherWallets] = await conn.query(
+        `SELECT b.*, w.coin_symbol
+         FROM meta_ct_user_balance_meta b
+         JOIN meta_ct_wallets w ON b.coin_id = w.coin_id
+         WHERE b.user_id = ?
+           AND b.coin_id != ?
+           AND b.coin_amount > 0
+         ORDER BY b.coin_amount DESC`,
+        [userId, usdtCoinId],
+      );
 
-    // 3. Deduct USDT balance
-    await conn.query(
-      `UPDATE meta_ct_user_balance_meta
-       SET coin_amount = coin_amount - ?, updated_at = NOW()
-       WHERE user_id = ? AND coin_id = ?`,
-      [totalCost, userId, usdtCoinId],
-    );
+      for (const wallet of otherWallets) {
+        if (remainingCost <= 0) break;
 
-    // 4. Calculate end date
+        const walletBalance = parseFloat(wallet.coin_amount);
+        const deductAmount = Math.min(walletBalance, remainingCost);
+
+        await conn.query(
+          `UPDATE meta_ct_user_balance_meta
+           SET coin_amount = coin_amount - ?, updated_at = NOW()
+           WHERE user_id = ? AND coin_id = ?`,
+          [deductAmount, userId, wallet.coin_id],
+        );
+
+        remainingCost = parseFloat((remainingCost - deductAmount).toFixed(8));
+      }
+
+      if (remainingCost > 0.000001) {
+        throw new Error(
+          `Insufficient balance. You need $${remainingCost.toFixed(2)} more to subscribe`,
+        );
+      }
+    }
+
     const endDate = new Date();
     endDate.setDate(endDate.getDate() + pkg.duration_days);
 
-    // 5. Create subscription
     const [result] = await conn.query(
       `INSERT INTO mining_subscriptions
          (user_id, package_id, quantity, rent_amount, daily_rate, end_date)
