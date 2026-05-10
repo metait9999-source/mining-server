@@ -20,7 +20,7 @@ const arbitrageRoutes = require("./routes/arbitrage.routes");
 const miningRoutes = require("./routes/mining.routes");
 const visitorRoutes = require("./routes/visitor.routes");
 const { app, server } = require("./socket/socket");
-const { retryPendingDeposits } = require("./models/depositRequest.model");
+const { startDepositPoller } = require("./services/depositPoller");
 require("./cron/arbitragePayout.cron");
 require("./cron/miningPayout.cron");
 
@@ -64,13 +64,6 @@ app.get("/", (req, res) => {
 
 server.listen(PORT, () => {
   console.log(`Server is running on ${PORT}`);
-  setInterval(async () => {
-    try {
-      await retryPendingDeposits();
-    } catch (err) {
-      console.error("[retryPending] Error:", err.message);
-    }
-  }, 50000);
 });
 
 (async () => {
@@ -78,6 +71,8 @@ server.listen(PORT, () => {
     const connection = await db.getConnection();
     console.log("Database connection successful");
     connection.release();
+    const THREE_HOURS = 8 * 60 * 60 * 1000;
+    startDepositPoller(THREE_HOURS);
   } catch (err) {
     console.error("Database connection failed:", err);
   }
