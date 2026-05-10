@@ -15,33 +15,37 @@ async function subscribe(userId, packageId, quantity) {
     const totalCost = parseFloat(pkg.rent_amount) * quantity;
 
     const [usdtWalletRows] = await conn.query(
-      `SELECT coin_id FROM meta_ct_wallets WHERE coin_symbol = 'USDT' LIMIT 1`,
+      "SELECT coin_id FROM meta_ct_wallets WHERE coin_symbol = 'USDT' LIMIT 1",
     );
     const usdtCoinId = usdtWalletRows[0]?.coin_id;
     if (!usdtCoinId) throw new Error("USDT wallet not configured");
 
     const [usdtBalRows] = await conn.query(
-      `SELECT * FROM meta_ct_user_balance_meta WHERE user_id = ? AND coin_id = ?`,
+      "SELECT * FROM meta_ct_user_balance_meta WHERE user_id = ? AND coin_id = ?",
       [userId, usdtCoinId],
     );
-    const usdtBalance = parseFloat(usdtBalRows[0]?.coin_amount || 0);
 
+    const usdtBalance = parseFloat(usdtBalRows[0]?.usd_amount || 0);
     let remainingCost = totalCost;
 
     if (usdtBalance >= totalCost) {
       await conn.query(
         `UPDATE meta_ct_user_balance_meta
-         SET coin_amount = coin_amount - ?, updated_at = NOW()
+           SET coin_amount = coin_amount - ?,
+               usd_amount  = usd_amount  - ?,
+               updated_at  = NOW()
          WHERE user_id = ? AND coin_id = ?`,
-        [totalCost, userId, usdtCoinId],
+        [totalCost, totalCost, userId, usdtCoinId],
       );
       remainingCost = 0;
     } else if (usdtBalance > 0) {
       await conn.query(
         `UPDATE meta_ct_user_balance_meta
-         SET coin_amount = coin_amount - ?, updated_at = NOW()
+           SET coin_amount = coin_amount - ?,
+               usd_amount  = usd_amount  - ?,
+               updated_at  = NOW()
          WHERE user_id = ? AND coin_id = ?`,
-        [usdtBalance, userId, usdtCoinId],
+        [usdtBalance, usdtBalance, userId, usdtCoinId],
       );
       remainingCost = parseFloat((totalCost - usdtBalance).toFixed(8));
     }
@@ -49,26 +53,29 @@ async function subscribe(userId, packageId, quantity) {
     if (remainingCost > 0) {
       const [otherWallets] = await conn.query(
         `SELECT b.*, w.coin_symbol
-         FROM meta_ct_user_balance_meta b
-         JOIN meta_ct_wallets w ON b.coin_id = w.coin_id
-         WHERE b.user_id = ?
-           AND b.coin_id != ?
-           AND b.coin_amount > 0
-         ORDER BY b.coin_amount DESC`,
+           FROM meta_ct_user_balance_meta b
+           JOIN meta_ct_wallets w ON b.coin_id = w.coin_id
+          WHERE b.user_id  = ?
+            AND b.coin_id != ?
+            AND b.usd_amount > 0
+          ORDER BY b.usd_amount DESC`,
         [userId, usdtCoinId],
       );
 
       for (const wallet of otherWallets) {
         if (remainingCost <= 0) break;
 
-        const walletBalance = parseFloat(wallet.coin_amount);
+        const walletBalance = parseFloat(wallet.usd_amount);
         const deductAmount = Math.min(walletBalance, remainingCost);
 
+        // Update both columns
         await conn.query(
           `UPDATE meta_ct_user_balance_meta
-           SET coin_amount = coin_amount - ?, updated_at = NOW()
+             SET coin_amount = coin_amount - ?,
+                 usd_amount  = usd_amount  - ?,
+                 updated_at  = NOW()
            WHERE user_id = ? AND coin_id = ?`,
-          [deductAmount, userId, wallet.coin_id],
+          [deductAmount, deductAmount, userId, wallet.coin_id],
         );
 
         remainingCost = parseFloat((remainingCost - deductAmount).toFixed(8));
@@ -81,6 +88,7 @@ async function subscribe(userId, packageId, quantity) {
       }
     }
 
+    // 6. Create subscription
     const endDate = new Date();
     endDate.setDate(endDate.getDate() + pkg.duration_days);
 
@@ -105,10 +113,10 @@ async function getByUserId(userId) {
   const [rows] = await db.query(
     `SELECT s.*, p.name AS package_name, p.duration_days,
             p.computing, p.power, p.color
-     FROM mining_subscriptions s
-     JOIN mining_packages p ON s.package_id = p.id
-     WHERE s.user_id = ?
-     ORDER BY s.created_at DESC`,
+       FROM mining_subscriptions s
+       JOIN mining_packages p ON s.package_id = p.id
+      WHERE s.user_id = ?
+      ORDER BY s.created_at DESC`,
     [userId],
   );
   return rows;
@@ -118,10 +126,10 @@ async function getAll() {
   const [rows] = await db.query(
     `SELECT s.*, p.name AS package_name, p.duration_days,
             u.name AS user_name, u.uuid AS user_uuid
-     FROM mining_subscriptions s
-     JOIN mining_packages p ON s.package_id = p.id
-     JOIN meta_ct_user u ON s.user_id = u.id
-     ORDER BY s.created_at DESC`,
+       FROM mining_subscriptions s
+       JOIN mining_packages p ON s.package_id = p.id
+       JOIN meta_ct_user u ON s.user_id = u.id
+      ORDER BY s.created_at DESC`,
   );
   return rows;
 }
@@ -129,10 +137,10 @@ async function getAll() {
 async function getActiveDue() {
   const [rows] = await db.query(
     `SELECT s.*, p.duration_days
-     FROM mining_subscriptions s
-     JOIN mining_packages p ON s.package_id = p.id
-     WHERE s.status = 'active'
-       AND (s.last_paid_at IS NULL OR DATE(s.last_paid_at) < CURDATE())`,
+       FROM mining_subscriptions s
+       JOIN mining_packages p ON s.package_id = p.id
+      WHERE s.status = 'active'
+        AND (s.last_paid_at IS NULL OR DATE(s.last_paid_at) < CURDATE())`,
   );
   return rows;
 }
@@ -150,23 +158,24 @@ async function processPayout(subscriptionId) {
     if (!sub) throw new Error("Subscription not found or inactive");
 
     const isComplete = new Date() >= new Date(sub.end_date);
-
-    const interest = (
-      (parseFloat(sub.rent_amount) * parseFloat(sub.daily_rate)) /
-      100
-    ).toFixed(7);
+    const principal = parseFloat(sub.rent_amount);
+    const interest = parseFloat(
+      ((principal * parseFloat(sub.daily_rate)) / 100).toFixed(7),
+    );
 
     const [walletRows] = await conn.query(
-      `SELECT coin_id FROM meta_ct_wallets WHERE coin_symbol = 'USDT' LIMIT 1`,
+      "SELECT coin_id FROM meta_ct_wallets WHERE coin_symbol = 'USDT' LIMIT 1",
     );
     const usdtCoinId = walletRows[0]?.coin_id;
     if (!usdtCoinId) throw new Error("USDT wallet not configured");
 
     await conn.query(
       `UPDATE meta_ct_user_balance_meta
-       SET coin_amount = coin_amount + ?, updated_at = NOW()
+         SET coin_amount = coin_amount + ?,
+             usd_amount  = usd_amount  + ?,
+             updated_at  = NOW()
        WHERE user_id = ? AND coin_id = ?`,
-      [interest, sub.user_id, usdtCoinId],
+      [interest, interest, sub.user_id, usdtCoinId],
     );
 
     await conn.query(
@@ -176,38 +185,38 @@ async function processPayout(subscriptionId) {
     );
 
     await conn.query(
-      `UPDATE mining_subscriptions SET total_earned = total_earned + ? WHERE id = ?`,
+      "UPDATE mining_subscriptions SET total_earned = total_earned + ? WHERE id = ?",
       [interest, sub.id],
     );
 
     if (isComplete) {
       await conn.query(
         `UPDATE meta_ct_user_balance_meta
-         SET coin_amount = coin_amount + ?, updated_at = NOW()
+           SET coin_amount = coin_amount + ?,
+               usd_amount  = usd_amount  + ?,
+               updated_at  = NOW()
          WHERE user_id = ? AND coin_id = ?`,
-        [sub.rent_amount, sub.user_id, usdtCoinId],
+        [principal, principal, sub.user_id, usdtCoinId],
       );
 
       await conn.query(
         `INSERT INTO mining_payouts (subscription_id, user_id, amount, type)
          VALUES (?, ?, ?, 'principal')`,
-        [sub.id, sub.user_id, sub.rent_amount],
+        [sub.id, sub.user_id, principal],
       );
     }
 
     await conn.query(
       `UPDATE mining_subscriptions
-       SET last_paid_at = NOW(), status = ?, updated_at = NOW()
+         SET last_paid_at = NOW(),
+             status       = ?,
+             updated_at   = NOW()
        WHERE id = ?`,
       [isComplete ? "completed" : "active", sub.id],
     );
 
     await conn.commit();
-    return {
-      interest,
-      principal: isComplete ? sub.rent_amount : 0,
-      isComplete,
-    };
+    return { interest, principal: isComplete ? principal : 0, isComplete };
   } catch (err) {
     await conn.rollback();
     throw err;
@@ -229,25 +238,30 @@ async function cancel(subscriptionId, userId) {
     if (!sub) throw new Error("Active subscription not found");
 
     const [walletRows] = await conn.query(
-      `SELECT coin_id FROM meta_ct_wallets WHERE coin_symbol = 'USDT' LIMIT 1`,
+      "SELECT coin_id FROM meta_ct_wallets WHERE coin_symbol = 'USDT' LIMIT 1",
     );
     const usdtCoinId = walletRows[0]?.coin_id;
+    if (!usdtCoinId) throw new Error("USDT wallet not configured");
+
+    const principal = parseFloat(sub.rent_amount);
 
     await conn.query(
       `UPDATE meta_ct_user_balance_meta
-       SET coin_amount = coin_amount + ?, updated_at = NOW()
+         SET coin_amount = coin_amount + ?,
+             usd_amount  = usd_amount  + ?,
+             updated_at  = NOW()
        WHERE user_id = ? AND coin_id = ?`,
-      [sub.rent_amount, sub.user_id, usdtCoinId],
+      [principal, principal, sub.user_id, usdtCoinId],
     );
 
     await conn.query(
       `INSERT INTO mining_payouts (subscription_id, user_id, amount, type)
        VALUES (?, ?, ?, 'principal')`,
-      [sub.id, sub.user_id, sub.rent_amount],
+      [sub.id, sub.user_id, principal],
     );
 
     await conn.query(
-      `UPDATE mining_subscriptions SET status = 'cancelled', updated_at = NOW() WHERE id = ?`,
+      "UPDATE mining_subscriptions SET status = 'cancelled', updated_at = NOW() WHERE id = ?",
       [sub.id],
     );
 

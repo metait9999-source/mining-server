@@ -25,8 +25,12 @@ async function getCoinPriceUSD(chain) {
     const res = await axios.get(
       `https://api.coinlore.net/api/ticker/?id=${id}`,
     );
-    return parseFloat(res.data?.[0]?.price_usd || 1);
+    const price = parseFloat(res.data?.[0]?.price_usd);
+    return isNaN(price) ? 1 : price;
   } catch {
+    console.error(
+      `[getCoinPriceUSD] Failed to fetch price for ${chain}, defaulting to 1`,
+    );
     return 1;
   }
 }
@@ -49,7 +53,7 @@ async function creditDeposit({
 }) {
   if (await isAlreadyProcessed(txHash, chain)) {
     console.log(
-      `[chainDeposit] Already processed tx ${txHash} on ${chain}, skipping.`,
+      `[chainDeposit] Already processed tx=${txHash} chain=${chain}, skipping.`,
     );
     return null;
   }
@@ -59,24 +63,24 @@ async function creditDeposit({
 
   const priceUSD = await getCoinPriceUSD(chain);
   const usdAmount = parseFloat((amount * priceUSD).toFixed(7));
+
   console.log(
-    `[chainDeposit] ${amount} ${chain} × $${priceUSD} = $${usdAmount} USD`,
+    `[chainDeposit] ${amount} ${chain} × $${priceUSD} = $${usdAmount} USD` +
+      ` | user=${userId} tx=${txHash}`,
   );
 
   const connection = await db.getConnection();
   try {
     await connection.beginTransaction();
 
-    // 1. Insert chain deposit record
     const [insertResult] = await connection.query(
       `INSERT INTO meta_ct_chain_deposits
          (user_id, chain, coin_id, tx_hash, from_address, to_address, amount, status)
        VALUES (?, ?, ?, ?, ?, ?, ?, 'confirmed')`,
-      [userId, chain, coinId, txHash, fromAddress, toAddress, amount],
+      [userId, chain, coinId, txHash, fromAddress || null, toAddress, amount],
     );
     const depositId = insertResult.insertId;
 
-    // 2. Insert balance row if not exists, otherwise ADD to existing balance
     await connection.query(
       `INSERT INTO meta_ct_user_balance_meta (user_id, coin_id, coin_amount, usd_amount)
        VALUES (?, ?, ?, ?)
@@ -86,7 +90,6 @@ async function creditDeposit({
       [userId, coinId, usdAmount, usdAmount],
     );
 
-    // 3. Set trade limit
     await connection.query(
       "UPDATE meta_ct_user SET trade_limit = 50 WHERE id = ?",
       [userId],
@@ -94,11 +97,9 @@ async function creditDeposit({
 
     await connection.commit();
 
-    // 4. Referral commission — outside transaction, non-fatal
     try {
       await creditReferralCommission({
         triggerUserId: userId,
-        type: "deposit",
         coinId,
         baseAmount: usdAmount,
       });
@@ -109,7 +110,7 @@ async function creditDeposit({
       );
     }
 
-    return { depositId, coinId, amount, usdAmount };
+    return { depositId, coinId, rawAmount: amount, usdAmount };
   } catch (err) {
     await connection.rollback();
     throw err;

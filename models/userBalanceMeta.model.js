@@ -1,10 +1,10 @@
 // models/userBalanceMeta.model.js
-const db = require('../config/db.config');
+const db = require("../config/db.config");
 
 // Get all user balance metas
 async function getAllUserBalanceMetas() {
   try {
-    const [rows] = await db.query('SELECT * FROM meta_ct_user_balance_meta');
+    const [rows] = await db.query("SELECT * FROM meta_ct_user_balance_meta");
     return rows;
   } catch (error) {
     throw new Error(error.message);
@@ -14,7 +14,10 @@ async function getAllUserBalanceMetas() {
 // Get a user balance meta by ID
 async function getUserBalanceMetaById(id) {
   try {
-    const [rows] = await db.query('SELECT * FROM meta_ct_user_balance_meta WHERE id = ?', [id]);
+    const [rows] = await db.query(
+      "SELECT * FROM meta_ct_user_balance_meta WHERE id = ?",
+      [id],
+    );
     return rows[0];
   } catch (error) {
     throw new Error(error.message);
@@ -24,7 +27,10 @@ async function getUserBalanceMetaById(id) {
 // Create a new user balance meta
 async function createUserBalanceMeta(balanceMetaData) {
   try {
-    const [result] = await db.query('INSERT INTO meta_ct_user_balance_meta SET ?', balanceMetaData);
+    const [result] = await db.query(
+      "INSERT INTO meta_ct_user_balance_meta SET ?",
+      balanceMetaData,
+    );
     return result.insertId;
   } catch (error) {
     throw new Error(error.message);
@@ -34,36 +40,29 @@ async function createUserBalanceMeta(balanceMetaData) {
 // Update a user balance meta by ID
 async function updateUserBalanceMeta(id, balanceMetaData) {
   try {
-    const [result] = await db.query('UPDATE meta_ct_user_balance_meta SET ? WHERE id = ?', [balanceMetaData, id]);
+    const [result] = await db.query(
+      "UPDATE meta_ct_user_balance_meta SET ? WHERE id = ?",
+      [balanceMetaData, id],
+    );
     return result.affectedRows;
   } catch (error) {
     throw new Error(error.message);
   }
 }
 
- async function updateUserBalance(userId, coinId, amount) {
+async function updateUserBalance(userId, coinId, usdAmount) {
   try {
-    // Ensure the amount is treated as a number
-    const numericAmount = parseFloat(amount);
+    const amount = parseFloat(usdAmount);
+    if (isNaN(amount) || amount <= 0) throw new Error("Invalid usdAmount");
 
-    const [rows] = await db.query(
-      'SELECT * FROM meta_ct_user_balance_meta WHERE user_id = ? AND coin_id = ?',
-      [userId, coinId]
+    await db.query(
+      `INSERT INTO meta_ct_user_balance_meta (user_id, coin_id, coin_amount, usd_amount)
+       VALUES (?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         coin_amount = coin_amount + VALUES(coin_amount),
+         usd_amount  = usd_amount  + VALUES(usd_amount)`,
+      [userId, coinId, amount, amount],
     );
-
-    if (rows.length > 0) {
-      // Update the existing balance using a proper numeric operation
-      await db.query(
-        'UPDATE meta_ct_user_balance_meta SET coin_amount = coin_amount + ?, updated_at = NOW() WHERE user_id = ? AND coin_id = ?',
-        [numericAmount, userId, coinId]
-      );
-    } else {
-      // Insert a new balance entry if it doesn't exist, initializing with the given amount
-      await db.query(
-        'INSERT INTO meta_ct_user_balance_meta (user_id, coin_id, coin_amount, usd_amount, created_at, updated_at) VALUES (?, ?, ?, 0, NOW(), NOW())',
-        [userId, coinId, numericAmount]
-      );
-    }
   } catch (error) {
     throw new Error(error.message);
   }
@@ -72,7 +71,10 @@ async function updateUserBalanceMeta(id, balanceMetaData) {
 // Delete a user balance meta by ID
 async function deleteUserBalanceMeta(id) {
   try {
-    const [result] = await db.query('DELETE FROM meta_ct_user_balance_meta WHERE id = ?', [id]);
+    const [result] = await db.query(
+      "DELETE FROM meta_ct_user_balance_meta WHERE id = ?",
+      [id],
+    );
     return result.affectedRows;
   } catch (error) {
     throw new Error(error.message);
@@ -107,8 +109,8 @@ async function getOrCreateUserBalance(userId, coinId) {
       }
     }
   } catch (error) {
-    console.error('Error fetching or creating user balance:', error.message);
-    throw new Error('Failed to retrieve or create user balance');
+    console.error("Error fetching or creating user balance:", error.message);
+    throw new Error("Failed to retrieve or create user balance");
   }
 }
 
@@ -125,11 +127,10 @@ async function updateUserBalanceCoinAmount(userId, coinId, coinAmount) {
 
     return result.affectedRows > 0;
   } catch (error) {
-    console.error('Error updating user balance:', error.message);
-    throw new Error('Failed to update user balance');
+    console.error("Error updating user balance:", error.message);
+    throw new Error("Failed to update user balance");
   }
 }
-
 
 module.exports = {
   getAllUserBalanceMetas,
@@ -139,5 +140,5 @@ module.exports = {
   updateUserBalance,
   deleteUserBalanceMeta,
   getOrCreateUserBalance,
-  updateUserBalanceCoinAmount
+  updateUserBalanceCoinAmount,
 };

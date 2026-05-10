@@ -1,26 +1,15 @@
 const express = require("express");
-const depositController = require("../controllers/deposit.controller");
-const uploadMiddleware = require("../middlewares/uploadMiddleware");
+const router = express.Router();
+const controller = require("../controllers/deposit.controller");
 const checkFrozen = require("../middlewares/checkFrozen");
 
-const router = express.Router();
+router.post("/check", checkFrozen, controller.checkDeposit);
+router.get("/user/:userId", controller.getDepositsByUserId);
 
-router.get("/", depositController.getAllDeposits);
-router.get("/unseen-count", depositController.getUnseenCount);
-router.get("/:id", depositController.getDepositById);
-router.post(
-  "/",
-  uploadMiddleware,
-  checkFrozen,
-  depositController.createDeposit,
-);
-router.put("/mark-seen", depositController.markAllSeen);
-router.put("/:id", depositController.updateDeposit);
-router.delete("/:id", depositController.deleteDeposit);
-router.get(
-  "/latest/:userId/coin/:coinId",
-  depositController.getLatestDepositByUserIdAndCoinId,
-);
-router.get("/user/:userId", depositController.getLatestDepositByUserId);
+router.get("/", controller.getAllDeposits);
+router.get("/unseen-count", controller.getUnseenCount);
+router.put("/mark-seen", controller.markAllSeen);
+router.get("/:id", controller.getDepositById);
+router.delete("/:id", controller.deleteDeposit);
 
 module.exports = router;
