@@ -14,11 +14,49 @@ const USDT_ERC20_ABI = [
   "function balanceOf(address) view returns (uint256)",
   "function transfer(address to, uint256 amount) returns (bool)",
 ];
+
 const TRX_GAS_RESERVE = 15;
 const ETH_GAS_RESERVE = "0.005";
+const TRX_ACTIVATION_FEE = 1; // 1 TRX to activate a new account
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Tron account activation check
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function isTronAccountActivated(address) {
+  try {
+    const res = await axios.get(
+      `https://api.trongrid.io/v1/accounts/${address}`,
+      { headers: { "TRON-PRO-API-KEY": process.env.TRON_API_KEY } },
+    );
+    // If data array is empty, account is not activated on-chain
+    return Array.isArray(res.data?.data) && res.data.data.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Activate a Tron address by sending a small TRX transfer to it.
+ * On Tron, an address is activated when it first receives TRX.
+ */
+async function activateTronAccount(address, masterTron) {
+  console.log(`[sweep:TRX] 🔑 Activating account ${address}...`);
+  const fundTx = await masterTron.trx.sendTransaction(
+    address,
+    TRX_ACTIVATION_FEE * 1_000_000, // 1 TRX in SUN
+  );
+  console.log(`[sweep:TRX] ✅ Activation tx sent: ${fundTx.txid}`);
+  // Wait for activation to propagate on-chain
+  console.log(`[sweep:TRX] ⏳ Waiting 20s for activation confirmation...`);
+  await sleep(20_000);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BTC helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
 async function getFeeRate() {
   try {
     const res = await axios.get(
@@ -72,6 +110,9 @@ async function broadcastTx(rawTx) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// TRX sweep
+// ─────────────────────────────────────────────────────────────────────────────
+
 async function sweepTRX(hdIndex) {
   const master = await getMasterWallets();
   const wallets = deriveAllWallets(process.env.WALLET_MNEMONIC, hdIndex);
@@ -82,9 +123,21 @@ async function sweepTRX(hdIndex) {
     privateKey: wallets.privateKeys.trx,
   });
 
+  const masterTron = new TronWeb({
+    fullHost: process.env.TRON_NODE || "https://api.trongrid.io",
+    headers: { "TRON-PRO-API-KEY": process.env.TRON_API_KEY },
+    privateKey: process.env.SWEEP_PRIVATE_KEY_TRX,
+  });
+
+  // Activate account first if needed
+  const activated = await isTronAccountActivated(wallets.trx);
+  if (!activated) {
+    await activateTronAccount(wallets.trx, masterTron);
+  }
+
   const balanceSun = await depositTron.trx.getBalance(wallets.trx);
   const balance = balanceSun / 1_000_000;
-  const sweepable = balance - 1;
+  const sweepable = balance - 1; // keep 1 TRX for fees
 
   if (sweepable <= 0) {
     console.log(`[sweep:TRX] Nothing to sweep from ${wallets.trx}`);
@@ -102,6 +155,9 @@ async function sweepTRX(hdIndex) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// USDT-TRC20 sweep
+// ─────────────────────────────────────────────────────────────────────────────
+
 async function sweepUSDT_TRC20(hdIndex) {
   const master = await getMasterWallets();
   const wallets = deriveAllWallets(process.env.WALLET_MNEMONIC, hdIndex);
@@ -111,12 +167,14 @@ async function sweepUSDT_TRC20(hdIndex) {
     headers: { "TRON-PRO-API-KEY": process.env.TRON_API_KEY },
     privateKey: wallets.privateKeys.trx,
   });
+
   const masterTron = new TronWeb({
     fullHost: process.env.TRON_NODE || "https://api.trongrid.io",
     headers: { "TRON-PRO-API-KEY": process.env.TRON_API_KEY },
     privateKey: process.env.SWEEP_PRIVATE_KEY_TRX,
   });
 
+  // 1. Check USDT balance first
   const contract = await depositTron.contract().at(USDT_TRC20_CONTRACT);
   const rawBalance = await contract.balanceOf(wallets.trx).call();
   const usdtBalance = Number(rawBalance) / 1_000_000;
@@ -126,6 +184,16 @@ async function sweepUSDT_TRC20(hdIndex) {
     return null;
   }
 
+  // 2. Activate account if not yet active — MUST happen before any tx
+  const activated = await isTronAccountActivated(wallets.trx);
+  if (!activated) {
+    console.log(
+      `[sweep:USDT-TRC20] Account not activated, activating first...`,
+    );
+    await activateTronAccount(wallets.trx, masterTron);
+  }
+
+  // 3. Top up TRX for gas if needed
   const trxSun = await masterTron.trx.getBalance(wallets.trx);
   if (trxSun / 1_000_000 < TRX_GAS_RESERVE) {
     const needed = TRX_GAS_RESERVE - trxSun / 1_000_000;
@@ -134,15 +202,18 @@ async function sweepUSDT_TRC20(hdIndex) {
       Math.ceil(needed * 1_000_000),
     );
     console.log(
-      `[sweep:USDT-TRC20] ⛽ Funded ${needed} TRX | tx: ${fundTx.txid}`,
+      `[sweep:USDT-TRC20] ⛽ Funded ${needed} TRX for gas | tx: ${fundTx.txid}`,
     );
-    await sleep(8000);
+    // Wait for gas funding to confirm
+    await sleep(8_000);
   }
 
+  // 4. Transfer USDT to master
   const amountSun = BigInt(Math.floor(usdtBalance * 1_000_000));
   const tx = await contract
     .transfer(master.usdt_trc20, amountSun)
     .send({ feeLimit: 40_000_000 });
+
   console.log(
     `[sweep:USDT-TRC20] ✅ ${usdtBalance} USDT → ${master.usdt_trc20} | tx: ${tx}`,
   );
@@ -150,11 +221,15 @@ async function sweepUSDT_TRC20(hdIndex) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ETH sweep
+// ─────────────────────────────────────────────────────────────────────────────
+
 async function sweepETH(hdIndex) {
   const master = await getMasterWallets();
   const wallets = deriveAllWallets(process.env.WALLET_MNEMONIC, hdIndex);
   const provider = new ethers.JsonRpcProvider(process.env.ETH_RPC_URL);
   const signer = new ethers.Wallet("0x" + wallets.privateKeys.eth, provider);
+
   const feeData = await provider.getFeeData();
   const gasLimit = 21000n;
   const gasCost = feeData.gasPrice * gasLimit;
@@ -180,6 +255,9 @@ async function sweepETH(hdIndex) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// USDT-ERC20 sweep
+// ─────────────────────────────────────────────────────────────────────────────
+
 async function sweepUSDT_ERC20(hdIndex) {
   const master = await getMasterWallets();
   const wallets = deriveAllWallets(process.env.WALLET_MNEMONIC, hdIndex);
@@ -203,6 +281,7 @@ async function sweepUSDT_ERC20(hdIndex) {
     return null;
   }
 
+  // Fund gas if needed — ETH accounts don't need activation, just ETH for gas
   const ethBalance = await provider.getBalance(signer.address);
   const gasReserve = ethers.parseEther(ETH_GAS_RESERVE);
   if (ethBalance < gasReserve) {
@@ -222,6 +301,10 @@ async function sweepUSDT_ERC20(hdIndex) {
   return tx.hash;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// BTC sweep
+// ─────────────────────────────────────────────────────────────────────────────
+
 async function sweepBTC(hdIndex) {
   const master = await getMasterWallets();
   const wallets = deriveAllWallets(process.env.WALLET_MNEMONIC, hdIndex);
@@ -231,7 +314,7 @@ async function sweepBTC(hdIndex) {
     `[sweep:BTC] starting for address=${address} master=${master.btc}`,
   );
 
-  // 1. Fetch UTXOs from Blockstream
+  // 1. Fetch UTXOs
   const utxoRes = await axios.get(
     `https://blockstream.info/api/address/${address}/utxo`,
   );
@@ -243,38 +326,32 @@ async function sweepBTC(hdIndex) {
     return null;
   }
 
-  // 2. Get fee rate with fallback
+  // 2. Fee rate
   const feeRate = await getFeeRate();
 
-  // 3. Derive key pair
+  // 3. Key pair
   const keyPair = ECPair.fromPrivateKey(
     Buffer.from(wallets.privateKeys.btc, "hex"),
     { network: bitcoin.networks.bitcoin },
   );
 
-  // 4. Detect address type and build payment accordingly
+  // 4. Address type
   const isLegacy = address.startsWith("1");
   const isP2SH = address.startsWith("3");
-  const isSegWit = address.startsWith("bc1");
-
   console.log(
     `[sweep:BTC] address type: ${isLegacy ? "legacy P2PKH" : isP2SH ? "P2SH" : "native SegWit"}`,
   );
 
   let payment;
-  let inputTemplate;
   let bytesPerInput;
 
   if (isLegacy) {
-    // P2PKH legacy
     payment = bitcoin.payments.p2pkh({
       pubkey: Buffer.from(keyPair.publicKey),
       network: bitcoin.networks.bitcoin,
     });
     bytesPerInput = 148;
-    // For legacy we need full raw tx hex
   } else if (isP2SH) {
-    // P2SH-P2WPKH wrapped SegWit
     payment = bitcoin.payments.p2sh({
       redeem: bitcoin.payments.p2wpkh({
         pubkey: Buffer.from(keyPair.publicKey),
@@ -284,7 +361,6 @@ async function sweepBTC(hdIndex) {
     });
     bytesPerInput = 91;
   } else {
-    // Native SegWit P2WPKH
     payment = bitcoin.payments.p2wpkh({
       pubkey: Buffer.from(keyPair.publicKey),
       network: bitcoin.networks.bitcoin,
@@ -311,7 +387,6 @@ async function sweepBTC(hdIndex) {
 
   for (const utxo of utxos) {
     if (isLegacy) {
-      // Legacy requires full raw tx hex
       const txHexRes = await axios.get(
         `https://blockstream.info/api/tx/${utxo.txid}/hex`,
       );
@@ -345,15 +420,12 @@ async function sweepBTC(hdIndex) {
     );
   }
 
-  // 7. Add output
+  // 7. Output
   const outputScript = bitcoin.address.toOutputScript(
     master.btc,
     bitcoin.networks.bitcoin,
   );
-  psbt.addOutput({
-    script: outputScript,
-    value: BigInt(sweepSat),
-  });
+  psbt.addOutput({ script: outputScript, value: BigInt(sweepSat) });
 
   // 8. Sign and finalize
   psbt.signAllInputs(keyPair);
@@ -361,7 +433,7 @@ async function sweepBTC(hdIndex) {
   const rawTx = psbt.extractTransaction().toHex();
   console.log(`[sweep:BTC] raw tx built, broadcasting...`);
 
-  // 9. Broadcast with fallback
+  // 9. Broadcast
   const txHash = await broadcastTx(rawTx);
   console.log(
     `[sweep:BTC] ✅ ${sweepSat / 1e8} BTC → ${master.btc} | tx: ${txHash}`,

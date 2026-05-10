@@ -8,6 +8,7 @@ const {
 } = require("./chainDeposit.model");
 const { sweepChain } = require("../services/sweep");
 const Deposit = require("./deposit.model");
+const { getReceiverSocketId, io } = require("../socket/socket");
 
 const tronWeb = new TronWeb({
   fullHost: process.env.TRON_NODE || "https://api.trongrid.io",
@@ -18,6 +19,7 @@ const USDT_TRC20_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t";
 const USDT_ERC20_CONTRACT = "0xdAC17F958D2ee523a2206206994597C13D831ec7";
 const SCAN_WINDOW_TRON_SEC = 30 * 60;
 const SCAN_WINDOW_ETH_BLOCKS = 150;
+const CHECK_DELAY_MS = 5 * 60 * 1000;
 
 const COIN_CHAIN_MAP = {
   TRX: "trx",
@@ -227,6 +229,104 @@ async function verifyOnChain(chain, toAddress) {
   }
 }
 
+async function _checkInBackground({ userId, coinId, chain, toAddress, user }) {
+  try {
+    console.log(
+      `[checkDeposit] ⏳ Waiting 5 min before checking...` +
+        ` user=${userId} chain=${chain}`,
+    );
+    await new Promise((r) => setTimeout(r, CHECK_DELAY_MS));
+    console.log(
+      `[checkDeposit] 🔍 Checking on-chain now...` +
+        ` user=${userId} chain=${chain}`,
+    );
+
+    const verified = await verifyOnChain(chain, toAddress);
+
+    if (!verified) {
+      console.log(
+        `[checkDeposit] ❌ Not found after 5 min wait. user=${userId} chain=${chain}`,
+      );
+      const userSocket = getReceiverSocketId(userId);
+      if (userSocket) {
+        io.to(userSocket).emit("depositNotFound", {
+          coinId,
+          message:
+            "No deposit detected on-chain. Please try again after sending.",
+        });
+      }
+      return;
+    }
+
+    if (await isAlreadyProcessed(verified.txHash, chain)) {
+      console.log(
+        `[checkDeposit] Already processed.` +
+          ` user=${userId} tx=${verified.txHash}`,
+      );
+      return;
+    }
+
+    const creditResult = await creditDeposit({
+      userId,
+      chain,
+      txHash: verified.txHash,
+      fromAddress: verified.fromAddress,
+      toAddress,
+      amount: verified.actualAmount,
+    });
+
+    if (!creditResult) return;
+
+    await Deposit.create({
+      userId,
+      coinId,
+      walletFrom: verified.fromAddress || "",
+      walletTo: toAddress,
+      txHash: verified.txHash || null,
+      usdAmount: creditResult.usdAmount,
+      status: "approved",
+    });
+
+    console.log(
+      `[checkDeposit] ✅ Credited user=${userId} chain=${chain}` +
+        ` raw=${verified.actualAmount} usd=$${creditResult.usdAmount}`,
+    );
+
+    const userSocket = getReceiverSocketId(userId);
+    if (userSocket) {
+      io.to(userSocket).emit("depositApproved", {
+        coinId,
+        rawAmount: verified.actualAmount,
+        usdAmount: creditResult.usdAmount,
+        txHash: verified.txHash,
+      });
+    }
+
+    const adminSocket = getReceiverSocketId(0);
+    if (adminSocket) {
+      io.to(adminSocket).emit("newDeposit", {
+        userId,
+        coinId,
+        usdAmount: creditResult.usdAmount,
+        txHash: verified.txHash,
+      });
+    }
+
+    sweepChain(chain, user.hd_index)
+      .then((sweptTx) => {
+        if (sweptTx) markSwept(creditResult.depositId, sweptTx);
+      })
+      .catch((err) =>
+        console.error("[checkDeposit] Sweep error:", err.message),
+      );
+  } catch (err) {
+    console.error(
+      `[checkDeposit] Background error user=${userId}:`,
+      err.message,
+    );
+  }
+}
+
 async function checkAndCreditDeposit({ userId, coinId }) {
   const [[user]] = await db.query(
     `SELECT id, hd_index, wallet_trx, wallet_eth, wallet_btc
@@ -249,61 +349,14 @@ async function checkAndCreditDeposit({ userId, coinId }) {
 
   if (!toAddress) throw new Error("Wallet not assigned to this user yet");
 
-  const verified = await verifyOnChain(chain, toAddress);
-  if (!verified) {
-    return {
-      status: "not_found",
-      message:
-        "No deposit detected on-chain yet. Please try again after sending.",
-    };
-  }
-
-  if (await isAlreadyProcessed(verified.txHash, chain)) {
-    return {
-      status: "already_credited",
-      message: "This transaction has already been credited to your account.",
-    };
-  }
-
-  const creditResult = await creditDeposit({
-    userId,
-    chain,
-    txHash: verified.txHash,
-    fromAddress: verified.fromAddress,
-    toAddress,
-    amount: verified.actualAmount,
-  });
-
-  if (!creditResult) {
-    return {
-      status: "already_credited",
-      message: "This transaction has already been credited to your account.",
-    };
-  }
-
-  await Deposit.create({
-    userId,
-    coinId,
-    walletFrom: verified.fromAddress || "",
-    walletTo: toAddress,
-    txHash: verified.txHash || null,
-    usdAmount: creditResult.usdAmount,
-    status: "approved",
-  });
-
-  sweepChain(chain, user.hd_index)
-    .then((sweptTx) => {
-      if (sweptTx) markSwept(creditResult.depositId, sweptTx);
-    })
-    .catch((err) => console.error("[checkDeposit] Sweep error:", err.message));
+  setImmediate(() =>
+    _checkInBackground({ userId, coinId, chain, toAddress, user }),
+  );
 
   return {
-    status: "credited",
-    txHash: verified.txHash,
-    rawAmount: verified.actualAmount,
-    usdAmount: creditResult.usdAmount,
-    coinId,
-    message: "Deposit detected and credited to your account.",
+    status: "processing",
+    message:
+      "We are checking your deposit. You will be notified automatically within 5 minutes once it is detected.",
   };
 }
 

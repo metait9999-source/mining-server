@@ -3,34 +3,34 @@ const db = require("../config/db.config");
 class Deposit {
   static async getAll() {
     const [rows] = await db.query(`
-      SELECT
-        d.*,
-        u.uuid     AS user_uuid,
-        u.username AS user_username,
-        u.email    AS user_email,
-        w.coin_name,
-        w.coin_symbol
-      FROM meta_ct_deposits AS d
-      JOIN meta_ct_user    AS u ON d.user_id = u.id
-      JOIN meta_ct_wallets AS w ON d.coin_id  = w.coin_id
-      ORDER BY d.created_at DESC
-    `);
+    SELECT
+      d.*,
+      u.uuid  AS user_uuid,
+      u.name  AS user_name,
+      u.email AS user_email,
+      w.coin_name,
+      w.coin_symbol
+    FROM meta_ct_deposits AS d
+    JOIN meta_ct_user         AS u ON d.user_id = u.id
+    LEFT JOIN meta_ct_wallets AS w ON d.coin_id  = w.coin_id
+    ORDER BY d.created_at DESC
+  `);
     return rows;
   }
 
   static async getById(id) {
     const [rows] = await db.query(
       `SELECT
-         d.*,
-         u.uuid     AS user_uuid,
-         u.username AS user_username,
-         u.email    AS user_email,
-         w.coin_name,
-         w.coin_symbol
-       FROM meta_ct_deposits AS d
-       JOIN meta_ct_user    AS u ON d.user_id = u.id
-       JOIN meta_ct_wallets AS w ON d.coin_id  = w.coin_id
-       WHERE d.id = ?`,
+       d.*,
+       u.uuid  AS user_uuid,
+       u.name  AS user_name,
+       u.email AS user_email,
+       w.coin_name,
+       w.coin_symbol
+     FROM meta_ct_deposits AS d
+     JOIN meta_ct_user         AS u ON d.user_id = u.id
+     LEFT JOIN meta_ct_wallets AS w ON d.coin_id  = w.coin_id
+     WHERE d.id = ?`,
       [id],
     );
     return rows[0] || null;
@@ -65,13 +65,13 @@ class Deposit {
   static async getByUserId(userId) {
     const [rows] = await db.query(
       `SELECT
-         d.*,
-         w.coin_name,
-         w.coin_symbol
-       FROM meta_ct_deposits AS d
-       JOIN meta_ct_wallets  AS w ON d.coin_id = w.coin_id
-       WHERE d.user_id = ?
-       ORDER BY d.created_at DESC`,
+       d.*,
+       w.coin_name,
+       w.coin_symbol
+     FROM meta_ct_deposits AS d
+     LEFT JOIN meta_ct_wallets AS w ON d.coin_id = w.coin_id
+     WHERE d.user_id = ?
+     ORDER BY d.created_at DESC`,
       [userId],
     );
     return rows;

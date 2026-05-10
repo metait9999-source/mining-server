@@ -1,159 +1,215 @@
-// manualSweepETH.js
-require("dotenv").config();
-const { ethers } = require("ethers");
-const db = require("./config/db.config");
-const { deriveAllWallets } = require("./services/walletDerivation");
-const { getMasterWallets } = require("./services/masterWallet");
+const { db } = require("./config");
+const { getUnswept } = require("./models/chainDeposit.model");
+const { sweepChain } = require("./services/sweep");
 
-// ── Fallback RPC list ────────────────────────────────────────────────────────
-// If Alchemy is down/broken, it tries the next one automatically
-const RPC_LIST = [
-  process.env.ETH_RPC_URL, // your Alchemy (primary)
-  "https://eth.llamarpc.com", // LlamaRPC (free, no key)
-  "https://rpc.ankr.com/eth", // Ankr (free tier)
-  "https://cloudflare-eth.com", // Cloudflare
-  "https://ethereum.publicnode.com", // PublicNode
-].filter(Boolean);
+require("dotenv").config({ path: require("path").join(__dirname, "../.env") });
 
-const USDT_ERC20_CONTRACT = "0xdAC17F958D2ee523a2206206994597C13D831ec7";
-const USDT_ERC20_ABI = [
-  "function balanceOf(address) view returns (uint256)",
-  "function transfer(address to, uint256 amount) returns (bool)",
-];
-const ETH_GAS_RESERVE = "0.005";
+const VALID_CHAINS = ["trx", "usdt_trc20", "eth", "usdt_erc20", "btc"];
 
-async function getWorkingProvider() {
-  for (const url of RPC_LIST) {
-    try {
-      const provider = new ethers.JsonRpcProvider(url);
-      await provider.getBlockNumber(); // simple connectivity check
-      console.log(`✅ RPC connected: ${url}`);
-      return provider;
-    } catch (err) {
-      console.warn(`⚠️  RPC failed: ${url} → ${err.message}`);
-    }
+const args = process.argv.slice(2);
+const getArg = (flag) => {
+  const i = args.indexOf(flag);
+  return i !== -1 ? args[i + 1] : null;
+};
+const hasFlag = (flag) => args.includes(flag);
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function sweepUser(userId, chain) {
+  console.log(`\n[sweep] Starting: user=${userId} chain=${chain}`);
+
+  const [[user]] = await db.query(
+    "SELECT id, hd_index, wallet_trx, wallet_eth, wallet_btc FROM meta_ct_user WHERE id = ?",
+    [userId],
+  );
+
+  if (!user) throw new Error(`User ${userId} not found`);
+  if (user.hd_index === null || user.hd_index === undefined) {
+    throw new Error(`User ${userId} has no HD wallet assigned`);
   }
-  throw new Error("All RPC providers failed. Check your network or API keys.");
-}
 
-// ── Sweep ETH ────────────────────────────────────────────────────────────────
-async function sweepETH(provider, master, wallets) {
-  const signer = new ethers.Wallet("0x" + wallets.privateKeys.eth, provider);
-  const feeData = await provider.getFeeData();
-  const gasLimit = 21000n;
-  const gasCost = feeData.gasPrice * gasLimit;
-  const balance = await provider.getBalance(signer.address);
-  const sweepable = balance - gasCost;
+  console.log(`[sweep] Found user hd_index=${user.hd_index}`);
 
-  if (sweepable <= 0n) {
+  const sweptTx = await sweepChain(chain, user.hd_index);
+
+  if (!sweptTx) {
     console.log(
-      `   ⚠️  ETH: nothing to sweep (bal=${ethers.formatEther(balance)} ETH)`,
+      `[sweep] ⚠️  Nothing to sweep — balance is zero or too low to cover fees`,
     );
-    return null;
+    return;
   }
 
-  const tx = await signer.sendTransaction({
-    to: master.eth,
-    value: sweepable,
-    gasLimit,
-    gasPrice: feeData.gasPrice,
-  });
-  await tx.wait();
-  console.log(
-    `   ✅ ETH: ${ethers.formatEther(sweepable)} ETH → ${master.eth} | ${tx.hash}`,
-  );
-  return tx.hash;
+  console.log(`[sweep] ✅ Done! tx=${sweptTx}`);
 }
 
-// ── Sweep USDT-ERC20 ─────────────────────────────────────────────────────────
-async function sweepUSDT(provider, master, wallets) {
-  const signer = new ethers.Wallet("0x" + wallets.privateKeys.eth, provider);
-  const masterW = new ethers.Wallet(
-    "0x" + process.env.SWEEP_PRIVATE_KEY_ETH,
-    provider,
-  );
-  const contract = new ethers.Contract(
-    USDT_ERC20_CONTRACT,
-    USDT_ERC20_ABI,
-    signer,
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function sweepDeposit(depositId) {
+  console.log(`\n[sweep] Starting: depositId=${depositId}`);
+
+  const [[deposit]] = await db.query(
+    "SELECT * FROM meta_ct_chain_deposits WHERE id = ?",
+    [depositId],
   );
 
-  const rawBalance = await contract.balanceOf(signer.address);
-  const usdtBalance = Number(rawBalance) / 1_000_000;
+  if (!deposit) throw new Error(`Deposit ${depositId} not found`);
 
-  if (usdtBalance <= 0) {
-    console.log(`   ⚠️  USDT-ERC20: nothing to sweep`);
-    return null;
+  if (deposit.status === "swept") {
+    console.log(`[sweep] ⚠️  Already swept. swept_tx=${deposit.swept_tx}`);
+    return;
   }
 
-  // Fund gas if needed
-  const ethBalance = await provider.getBalance(signer.address);
-  const gasReserve = ethers.parseEther(ETH_GAS_RESERVE);
-  if (ethBalance < gasReserve) {
-    const fundTx = await masterW.sendTransaction({
-      to: signer.address,
-      value: gasReserve - ethBalance,
-    });
-    await fundTx.wait();
-    console.log(`   ⛽ Gas funded for USDT transfer`);
-  }
+  const [[user]] = await db.query(
+    "SELECT id, hd_index FROM meta_ct_user WHERE id = ?",
+    [deposit.user_id],
+  );
 
-  const tx = await contract.transfer(master.usdt_erc20, rawBalance);
-  await tx.wait();
+  if (!user) throw new Error(`User ${deposit.user_id} not found`);
+
   console.log(
-    `   ✅ USDT-ERC20: ${usdtBalance} USDT → ${master.usdt_erc20} | ${tx.hash}`,
+    `[sweep] Found deposit user=${deposit.user_id} chain=${deposit.chain} hd_index=${user.hd_index}`,
   );
-  return tx.hash;
+
+  const sweptTx = await sweepChain(deposit.chain, user.hd_index);
+
+  if (!sweptTx) {
+    console.log(`[sweep] ⚠️  Nothing to sweep — balance may already be gone`);
+    return;
+  }
+
+  await markSwept(deposit.id, sweptTx);
+  console.log(`[sweep] ✅ Done! tx=${sweptTx}`);
 }
 
-// ── Main ─────────────────────────────────────────────────────────────────────
-async function main() {
-  const provider = await getWorkingProvider();
-  const master = await getMasterWallets();
+// ─────────────────────────────────────────────────────────────────────────────
 
-  const [users] = await db.query(
-    `SELECT id, hd_index, wallet_eth
-       FROM meta_ct_user
-      WHERE hd_index IS NOT NULL`,
-  );
+async function sweepAllPending() {
+  console.log(`\n[sweep] Fetching all unswept confirmed deposits...`);
 
-  console.log(`\nFound ${users.length} users — sweeping ETH + USDT-ERC20\n`);
-  console.log("─".repeat(60));
+  const unswept = await getUnswept();
 
-  let successCount = 0;
-  let skipCount = 0;
-  let errorCount = 0;
+  if (!unswept.length) {
+    console.log(`[sweep] ✅ No pending sweeps found`);
+    return;
+  }
 
-  for (const user of users) {
-    console.log(
-      `\n👤 User ${user.id} | index ${user.hd_index} | ${user.wallet_eth}`,
-    );
+  console.log(`[sweep] Found ${unswept.length} unswept deposits\n`);
 
+  let succeeded = 0;
+  let failed = 0;
+
+  for (const deposit of unswept) {
     try {
-      const wallets = deriveAllWallets(
-        process.env.WALLET_MNEMONIC,
-        user.hd_index,
+      const [[user]] = await db.query(
+        "SELECT id, hd_index FROM meta_ct_user WHERE id = ?",
+        [deposit.user_id],
       );
 
-      // ETH first (so gas is available for USDT)
-      const ethTx = await sweepETH(provider, master, wallets);
-      const usdtTx = await sweepUSDT(provider, master, wallets);
+      if (!user || user.hd_index === null || user.hd_index === undefined) {
+        console.log(
+          `[sweep] ⚠️  deposit=${deposit.id} — no HD index, skipping`,
+        );
+        failed++;
+        continue;
+      }
 
-      if (ethTx || usdtTx) successCount++;
-      else skipCount++;
+      console.log(
+        `[sweep] Processing deposit=${deposit.id} user=${deposit.user_id} chain=${deposit.chain}`,
+      );
+
+      const sweptTx = await sweepChain(deposit.chain, user.hd_index);
+
+      if (sweptTx) {
+        await markSwept(deposit.id, sweptTx);
+        console.log(`[sweep] ✅ deposit=${deposit.id} tx=${sweptTx}`);
+        succeeded++;
+      } else {
+        console.log(`[sweep] ⚠️  deposit=${deposit.id} — nothing to sweep`);
+        failed++;
+      }
     } catch (err) {
-      console.error(`   ❌ Error: ${err.message}`);
-      errorCount++;
+      console.error(`[sweep] ❌ deposit=${deposit.id} error: ${err.message}`);
+      failed++;
     }
-
-    // Small delay to avoid rate limits
-    await new Promise((r) => setTimeout(r, 1500));
   }
 
-  console.log("\n" + "─".repeat(60));
   console.log(
-    `✅ Done — swept: ${successCount} | skipped: ${skipCount} | errors: ${errorCount}`,
+    `\n[sweep] Summary: total=${unswept.length} succeeded=${succeeded} failed=${failed}`,
   );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function main() {
+  // Validate DB connection first
+  try {
+    const conn = await db.getConnection();
+    console.log("[sweep] ✅ DB connected");
+    conn.release();
+  } catch (err) {
+    console.error("[sweep] ❌ DB connection failed:", err.message);
+    process.exit(1);
+  }
+
+  try {
+    if (hasFlag("--all")) {
+      // Sweep all pending unswept deposits
+      await sweepAllPending();
+    } else if (hasFlag("--user")) {
+      // Sweep specific user + chain
+      const userId = getArg("--user");
+      const chain = getArg("--chain");
+
+      if (!userId) {
+        console.error("❌ --user <userId> is required");
+        process.exit(1);
+      }
+      if (!chain) {
+        console.error("❌ --chain <chain> is required");
+        process.exit(1);
+      }
+      if (!VALID_CHAINS.includes(chain)) {
+        console.error(`❌ Invalid chain. Valid: ${VALID_CHAINS.join(", ")}`);
+        process.exit(1);
+      }
+
+      await sweepUser(parseInt(userId), chain);
+    } else if (hasFlag("--deposit")) {
+      // Sweep specific deposit by ID
+      const depositId = getArg("--deposit");
+      if (!depositId) {
+        console.error("❌ --deposit <depositId> is required");
+        process.exit(1);
+      }
+
+      await sweepDeposit(parseInt(depositId));
+    } else {
+      // Show usage
+      console.log(`
+Usage:
+  node scripts/manualSweep.js --all
+    → Sweep all confirmed but unswept deposits
+
+  node scripts/manualSweep.js --user <userId> --chain <chain>
+    → Sweep a specific user on a specific chain
+    → Chains: ${VALID_CHAINS.join(", ")}
+
+  node scripts/manualSweep.js --deposit <depositId>
+    → Sweep a specific deposit record by ID
+
+Examples:
+  node scripts/manualSweep.js --all
+  node scripts/manualSweep.js --user 68 --chain usdt_trc20
+  node scripts/manualSweep.js --user 68 --chain trx
+  node scripts/manualSweep.js --deposit 12
+      `);
+      process.exit(0);
+    }
+  } catch (err) {
+    console.error(`\n[sweep] ❌ Fatal error: ${err.message}`);
+    process.exit(1);
+  }
+
   process.exit(0);
 }
 
