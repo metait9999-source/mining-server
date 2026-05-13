@@ -27,13 +27,12 @@ function deriveAllWallets(mnemonic, index) {
   const ethAddress = ethWallet.address;
 
   // ── BTC ──────────────────────────────────────────────────────────────────
-  const btcChild = root.derive(`m/44'/0'/0'/0/${index}`);
+  const btcChild = root.derive(`m/84'/0'/0'/0/${index}`);
   const btcPrivateKey = btcChild.privateKey;
   const btcKeyPair = ECPair.fromPrivateKey(btcPrivateKey, {
-    // ← CHANGED
     network: bitcoin.networks.bitcoin,
   });
-  const { address: btcAddress } = bitcoin.payments.p2pkh({
+  const { address: btcAddress } = bitcoin.payments.p2wpkh({
     pubkey: btcKeyPair.publicKey,
     network: bitcoin.networks.bitcoin,
   });
