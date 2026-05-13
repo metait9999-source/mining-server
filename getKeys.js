@@ -6,7 +6,7 @@ const { TronWeb } = require("tronweb");
 const { ethers } = require("ethers");
 
 const mnemonic =
-  "abstract cruise palm spehre spike fix hotel creek hobby gather coconut then"; // ← paste your Trust Wallet phrase
+  "dwarf machine armed garden jump divert south liquid pottery vapor kid slot"; // ← paste your Trust Wallet phrase
 
 const seed = bip39.mnemonicToSeedSync(mnemonic);
 const root = hdkey.fromMasterSeed(seed);

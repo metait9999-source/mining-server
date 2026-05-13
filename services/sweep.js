@@ -17,11 +17,12 @@ const USDT_ERC20_ABI = [
 
 const TRX_GAS_RESERVE = 15;
 const ETH_GAS_RESERVE = "0.005";
-const TRX_ACTIVATION_FEE = 1; // 1 TRX to activate a new account
+const TRX_ACTIVATION_FEE = 1; // 1 TRX minimum to activate
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Tron account activation check
+// Tron helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function isTronAccountActivated(address) {
@@ -30,7 +31,6 @@ async function isTronAccountActivated(address) {
       `https://api.trongrid.io/v1/accounts/${address}`,
       { headers: { "TRON-PRO-API-KEY": process.env.TRON_API_KEY } },
     );
-    // If data array is empty, account is not activated on-chain
     return Array.isArray(res.data?.data) && res.data.data.length > 0;
   } catch {
     return false;
@@ -38,19 +38,74 @@ async function isTronAccountActivated(address) {
 }
 
 /**
- * Activate a Tron address by sending a small TRX transfer to it.
- * On Tron, an address is activated when it first receives TRX.
+ * Send activation tx — no sleep inside, caller handles polling.
  */
 async function activateTronAccount(address, masterTron) {
-  console.log(`[sweep:TRX] 🔑 Activating account ${address}...`);
+  console.log(`[sweep:TRX] 🔑 Sending activation tx to ${address}...`);
+
   const fundTx = await masterTron.trx.sendTransaction(
     address,
-    TRX_ACTIVATION_FEE * 1_000_000, // 1 TRX in SUN
+    TRX_ACTIVATION_FEE * 1_000_000,
   );
-  console.log(`[sweep:TRX] ✅ Activation tx sent: ${fundTx.txid}`);
-  // Wait for activation to propagate on-chain
-  console.log(`[sweep:TRX] ⏳ Waiting 20s for activation confirmation...`);
-  await sleep(20_000);
+
+  console.log(`[sweep:TRX] Activation tx sent: ${fundTx.txid}`);
+  console.log(
+    `[sweep:TRX] Check on Tronscan: https://tronscan.org/#/transaction/${fundTx.txid}`,
+  );
+
+  // ── Verify the tx result — Tron returns result in the response ──
+  if (fundTx.result === false || fundTx.Error) {
+    throw new Error(
+      `[sweep:TRX] Activation tx failed on-chain: ${fundTx.Error || JSON.stringify(fundTx)}`,
+    );
+  }
+
+  // ── Wait 6s then confirm it landed on-chain ──
+  await sleep(6_000);
+  try {
+    const txInfo = await masterTron.trx.getTransaction(fundTx.txid);
+    console.log(
+      `[sweep:TRX] Tx status: ${JSON.stringify(txInfo?.ret || txInfo?.result || "unknown")}`,
+    );
+  } catch (err) {
+    console.log(`[sweep:TRX] Could not fetch tx info: ${err.message}`);
+  }
+
+  return fundTx.txid;
+}
+
+/**
+ * Activate and WAIT until the API confirms the account exists.
+ * Polls every 10s, up to 15 attempts (150s max).
+ */
+async function activateAndWait(address, masterTron) {
+  // Check if already active before sending anything
+  const alreadyActive = await isTronAccountActivated(address);
+  if (alreadyActive) {
+    console.log(`[sweep:TRX] ✅ Account already activated: ${address}`);
+    return;
+  }
+
+  await activateTronAccount(address, masterTron);
+
+  const MAX_ATTEMPTS = 15;
+  for (let i = 1; i <= MAX_ATTEMPTS; i++) {
+    console.log(
+      `[sweep:TRX] ⏳ Waiting 10s... activation check ${i}/${MAX_ATTEMPTS}`,
+    );
+    await sleep(10_000);
+
+    const active = await isTronAccountActivated(address);
+    if (active) {
+      console.log(`[sweep:TRX] ✅ Account confirmed active after ${i * 10}s`);
+      return;
+    }
+  }
+
+  throw new Error(
+    `[sweep:TRX] ❌ Account ${address} not activated after ${MAX_ATTEMPTS * 10}s. ` +
+      `Check the activation tx on Tronscan.`,
+  );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -129,18 +184,17 @@ async function sweepTRX(hdIndex) {
     privateKey: process.env.SWEEP_PRIVATE_KEY_TRX,
   });
 
-  // Activate account first if needed
-  const activated = await isTronAccountActivated(wallets.trx);
-  if (!activated) {
-    await activateTronAccount(wallets.trx, masterTron);
-  }
+  // Activate and verify before doing anything else
+  await activateAndWait(wallets.trx, masterTron);
 
   const balanceSun = await depositTron.trx.getBalance(wallets.trx);
   const balance = balanceSun / 1_000_000;
-  const sweepable = balance - 1; // keep 1 TRX for fees
+  const sweepable = balance - 1; // keep 1 TRX for future fees
 
   if (sweepable <= 0) {
-    console.log(`[sweep:TRX] Nothing to sweep from ${wallets.trx}`);
+    console.log(
+      `[sweep:TRX] Nothing to sweep from ${wallets.trx} (balance=${balance} TRX)`,
+    );
     return null;
   }
 
@@ -174,7 +228,17 @@ async function sweepUSDT_TRC20(hdIndex) {
     privateKey: process.env.SWEEP_PRIVATE_KEY_TRX,
   });
 
-  // 1. Check USDT balance first
+  const signerAddress = masterTron.address.fromPrivateKey(
+    process.env.SWEEP_PRIVATE_KEY_TRX,
+  );
+  const signerBalSun = await masterTron.trx.getBalance(signerAddress);
+  console.log(`[sweep:USDT-TRC20] Signer address: ${signerAddress}`);
+  console.log(
+    `[sweep:USDT-TRC20] Signer TRX balance: ${signerBalSun / 1_000_000} TRX`,
+  );
+  console.log(`[sweep:USDT-TRC20] Master TRX address: ${master.trx}`);
+  console.log(`[sweep:USDT-TRC20] Target deposit address: ${wallets.trx}`);
+  // 1. Check USDT balance first — no point activating if nothing to sweep
   const contract = await depositTron.contract().at(USDT_TRC20_CONTRACT);
   const rawBalance = await contract.balanceOf(wallets.trx).call();
   const usdtBalance = Number(rawBalance) / 1_000_000;
@@ -184,28 +248,31 @@ async function sweepUSDT_TRC20(hdIndex) {
     return null;
   }
 
-  // 2. Activate account if not yet active — MUST happen before any tx
-  const activated = await isTronAccountActivated(wallets.trx);
-  if (!activated) {
-    console.log(
-      `[sweep:USDT-TRC20] Account not activated, activating first...`,
-    );
-    await activateTronAccount(wallets.trx, masterTron);
-  }
+  console.log(`[sweep:USDT-TRC20] Found ${usdtBalance} USDT at ${wallets.trx}`);
 
-  // 3. Top up TRX for gas if needed
+  // 2. Activate account and WAIT until confirmed — must be done before any tx
+  await activateAndWait(wallets.trx, masterTron);
+
+  // 3. Top up TRX for gas — account is now confirmed active
   const trxSun = await masterTron.trx.getBalance(wallets.trx);
-  if (trxSun / 1_000_000 < TRX_GAS_RESERVE) {
-    const needed = TRX_GAS_RESERVE - trxSun / 1_000_000;
+  const trxBal = trxSun / 1_000_000;
+  console.log(`[sweep:USDT-TRC20] Current TRX balance: ${trxBal} TRX`);
+
+  if (trxBal < TRX_GAS_RESERVE) {
+    const needed = TRX_GAS_RESERVE - trxBal;
     const fundTx = await masterTron.trx.sendTransaction(
       wallets.trx,
       Math.ceil(needed * 1_000_000),
     );
     console.log(
-      `[sweep:USDT-TRC20] ⛽ Funded ${needed} TRX for gas | tx: ${fundTx.txid}`,
+      `[sweep:USDT-TRC20] ⛽ Funded ${needed.toFixed(2)} TRX for gas | tx: ${fundTx.txid}`,
     );
-    // Wait for gas funding to confirm
-    await sleep(8_000);
+
+    // Wait for gas funding to be confirmed on-chain
+    console.log(
+      `[sweep:USDT-TRC20] ⏳ Waiting 15s for gas funding confirmation...`,
+    );
+    await sleep(15_000);
   }
 
   // 4. Transfer USDT to master
@@ -281,7 +348,7 @@ async function sweepUSDT_ERC20(hdIndex) {
     return null;
   }
 
-  // Fund gas if needed — ETH accounts don't need activation, just ETH for gas
+  // ETH accounts don't need activation — just ensure gas
   const ethBalance = await provider.getBalance(signer.address);
   const gasReserve = ethers.parseEther(ETH_GAS_RESERVE);
   if (ethBalance < gasReserve) {
@@ -314,7 +381,6 @@ async function sweepBTC(hdIndex) {
     `[sweep:BTC] starting for address=${address} master=${master.btc}`,
   );
 
-  // 1. Fetch UTXOs
   const utxoRes = await axios.get(
     `https://blockstream.info/api/address/${address}/utxo`,
   );
@@ -326,16 +392,13 @@ async function sweepBTC(hdIndex) {
     return null;
   }
 
-  // 2. Fee rate
   const feeRate = await getFeeRate();
 
-  // 3. Key pair
   const keyPair = ECPair.fromPrivateKey(
     Buffer.from(wallets.privateKeys.btc, "hex"),
     { network: bitcoin.networks.bitcoin },
   );
 
-  // 4. Address type
   const isLegacy = address.startsWith("1");
   const isP2SH = address.startsWith("3");
   console.log(
@@ -368,7 +431,6 @@ async function sweepBTC(hdIndex) {
     bytesPerInput = 68;
   }
 
-  // 5. Estimate fee
   const estSize = utxos.length * bytesPerInput + 34 + 10;
   const feeSat = Math.ceil(feeRate * estSize);
   const totalSat = utxos.reduce((s, u) => s + u.value, 0);
@@ -382,7 +444,6 @@ async function sweepBTC(hdIndex) {
     return null;
   }
 
-  // 6. Build PSBT
   const psbt = new bitcoin.Psbt({ network: bitcoin.networks.bitcoin });
 
   for (const utxo of utxos) {
@@ -420,20 +481,17 @@ async function sweepBTC(hdIndex) {
     );
   }
 
-  // 7. Output
   const outputScript = bitcoin.address.toOutputScript(
     master.btc,
     bitcoin.networks.bitcoin,
   );
   psbt.addOutput({ script: outputScript, value: BigInt(sweepSat) });
 
-  // 8. Sign and finalize
   psbt.signAllInputs(keyPair);
   psbt.finalizeAllInputs();
   const rawTx = psbt.extractTransaction().toHex();
   console.log(`[sweep:BTC] raw tx built, broadcasting...`);
 
-  // 9. Broadcast
   const txHash = await broadcastTx(rawTx);
   console.log(
     `[sweep:BTC] ✅ ${sweepSat / 1e8} BTC → ${master.btc} | tx: ${txHash}`,
